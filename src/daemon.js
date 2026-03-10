@@ -16,10 +16,58 @@
 
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { readFileSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
-import { FigmaClient } from './figma-client.js';
+import { readFileSync, statSync, writeFileSync, unlinkSync, readdirSync } from 'fs';
+import { join, dirname } from 'path';
+import { homedir, tmpdir } from 'os';
+import { fileURLToPath, pathToFileURL } from 'url';
+
+// Hot-reload FigmaClient: copy to temp file and import (Node.js ES modules don't support cache busting)
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const figmaClientPath = join(__dirname, 'figma-client.js');
+let FigmaClient = null;
+let lastModTime = 0;
+let lastTempFile = null;
+
+async function getFigmaClient() {
+  try {
+    const stat = statSync(figmaClientPath);
+    const modTime = stat.mtimeMs;
+
+    // Reload if file changed or never loaded
+    if (!FigmaClient || modTime > lastModTime) {
+      // Clean up old temp files in project directory (keeps node_modules accessible)
+      try {
+        const oldFiles = readdirSync(__dirname).filter(f => f.startsWith('.figma-client-') && f.endsWith('.mjs'));
+        for (const f of oldFiles) {
+          try { unlinkSync(join(__dirname, f)); } catch {}
+        }
+      } catch {}
+
+      // Copy to temp file in same directory (so imports resolve correctly)
+      const tempFile = join(__dirname, `.figma-client-${modTime}.mjs`);
+      const content = readFileSync(figmaClientPath, 'utf8');
+      writeFileSync(tempFile, content);
+      lastTempFile = tempFile;
+
+      // Import from temp file
+      const tempUrl = pathToFileURL(tempFile).href;
+      const module = await import(tempUrl);
+      FigmaClient = module.FigmaClient;
+
+      const wasReload = lastModTime > 0;
+      lastModTime = modTime;
+      if (wasReload) console.log('[daemon] Hot-reloaded figma-client.js');
+    }
+  } catch (e) {
+    console.error('[daemon] Hot-reload error:', e.message);
+    // Fallback: just import normally
+    if (!FigmaClient) {
+      const module = await import('./figma-client.js');
+      FigmaClient = module.FigmaClient;
+    }
+  }
+  return FigmaClient;
+}
 
 const PORT = parseInt(process.env.DAEMON_PORT) || 3456;
 const MODE = process.env.DAEMON_MODE || 'auto'; // 'auto', 'cdp', 'plugin'
@@ -84,7 +132,7 @@ let cdpClient = null;
 let isCdpConnecting = false;
 let lastHealthCheck = 0;
 let lastHealthResult = false;
-const HEALTH_CACHE_MS = 5000; // Cache health for 5 seconds
+const HEALTH_CACHE_MS = 30000; // Cache health for 30 seconds (reduces overhead)
 
 // Plugin Client (Safe Mode)
 let pluginWs = null;
@@ -107,7 +155,7 @@ async function isCdpHealthy(forceCheck = false) {
   try {
     const result = await Promise.race([
       cdpClient.eval('1'), // Simple eval, just check connection works
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
     ]);
     lastHealthCheck = now;
     lastHealthResult = result === 1;
@@ -143,7 +191,8 @@ async function getCdpClient() {
 
   isCdpConnecting = true;
   try {
-    cdpClient = new FigmaClient();
+    const ClientClass = await getFigmaClient();
+    cdpClient = new ClientClass();
     await cdpClient.connect();
     lastHealthCheck = Date.now();
     lastHealthResult = true;
@@ -165,7 +214,7 @@ function isPluginConnected() {
   return pluginWs && pluginWs.readyState === WebSocket.OPEN;
 }
 
-async function evalViaPlugin(code) {
+async function evalViaPlugin(code, retryCount = 0) {
   if (!isPluginConnected()) {
     throw new Error('Plugin not connected. Start the Figma CLI Bridge plugin in Figma.');
   }
@@ -174,16 +223,51 @@ async function evalViaPlugin(code) {
     const id = ++pluginMsgId;
     const timeout = setTimeout(() => {
       pluginPendingRequests.delete(id);
-      reject(new Error('Plugin execution timeout (90s)'));
-    }, 90000); // 90s timeout
+      reject(new Error('Plugin execution timeout (25s)'));
+    }, 25000); // 25s timeout to match plugin-side timeout
 
-    pluginPendingRequests.set(id, { resolve, reject, timeout });
+    pluginPendingRequests.set(id, { resolve, reject, timeout, code, retryCount });
 
-    pluginWs.send(JSON.stringify({
-      action: 'eval',
-      id: id,
-      code: code
-    }));
+    try {
+      pluginWs.send(JSON.stringify({
+        action: 'eval',
+        id: id,
+        code: code
+      }));
+    } catch (sendError) {
+      clearTimeout(timeout);
+      pluginPendingRequests.delete(id);
+      reject(new Error(`Plugin send error: ${sendError.message}`));
+    }
+  });
+}
+
+// Batch eval via plugin (execute multiple codes, return all results)
+async function evalBatchViaPlugin(codes) {
+  if (!isPluginConnected()) {
+    throw new Error('Plugin not connected. Start the Figma CLI Bridge plugin in Figma.');
+  }
+
+  return new Promise((resolve, reject) => {
+    const id = ++pluginMsgId;
+    const timeout = setTimeout(() => {
+      pluginPendingRequests.delete(id);
+      reject(new Error('Plugin batch execution timeout (60s)'));
+    }, 60000); // 60s for batches
+
+    pluginPendingRequests.set(id, { resolve, reject, timeout, isBatch: true });
+
+    try {
+      pluginWs.send(JSON.stringify({
+        action: 'eval-batch',
+        id: id,
+        codes: codes
+      }));
+    } catch (sendError) {
+      clearTimeout(timeout);
+      pluginPendingRequests.delete(id);
+      reject(new Error(`Plugin batch send error: ${sendError.message}`));
+    }
   });
 }
 
@@ -312,14 +396,14 @@ async function handleRequest(req, res) {
 
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
-          const { action, code, jsx, jsxArray } = JSON.parse(body);
+          const { action, code, jsx, jsxArray, gap, vertical } = JSON.parse(body);
           let result;
 
-          const execWithTimeout = async (fn) => {
+          const execWithTimeout = async (fn, timeoutMs = 30000) => {
             return Promise.race([
               fn(),
               new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Execution timeout (90s)')), 90000)
+                setTimeout(() => reject(new Error(`Execution timeout (${timeoutMs/1000}s)`)), timeoutMs)
               )
             ]);
           };
@@ -328,20 +412,25 @@ async function handleRequest(req, res) {
             case 'eval':
               result = await execWithTimeout(() => executeEval(code));
               break;
-            case 'render':
+            case 'render': {
               // Parse JSX to code, then execute via unified eval (works with both CDP and Plugin)
-              const parser = new FigmaClient();
-              const renderCode = parser.parseJSX(jsx);
+              const ClientClass = await getFigmaClient();
+              const parser = new ClientClass();
+              const renderCode = await parser.parseJSX(jsx);
               result = await execWithTimeout(() => executeEval(renderCode));
               break;
-            case 'render-batch':
-              const batchParser = new FigmaClient();
-              result = [];
-              for (const j of jsxArray) {
-                const batchCode = batchParser.parseJSX(j);
-                result.push(await execWithTimeout(() => executeEval(batchCode)));
-              }
+            }
+            case 'render-batch': {
+              // Single eval for ALL frames (10x faster than loop)
+              const ClientClass = await getFigmaClient();
+              const batchParser = new ClientClass();
+              const batchCode = batchParser.parseJSXBatch(jsxArray, {
+                gap: gap || 40,
+                vertical: vertical || false
+              });
+              result = await execWithTimeout(() => executeEval(batchCode), 60000); // 60s for batches
               break;
+            }
             default:
               throw new Error(`Unknown action: ${action}`);
           }
@@ -353,12 +442,25 @@ async function handleRequest(req, res) {
           lastError = error;
           console.log(`[daemon] Attempt ${attempt + 1} failed: ${error.message}`);
 
-          // Force reconnect before retry (CDP only)
-          if (attempt < MAX_RETRIES && !isPluginConnected()) {
-            console.log('[daemon] Reconnecting before retry...');
+          // For Safe Mode: wait briefly for potential reconnect
+          if (attempt < MAX_RETRIES && MODE === 'plugin') {
+            console.log('[daemon] Safe Mode: waiting for plugin reconnect...');
+            // Wait up to 2s for plugin to reconnect
+            for (let i = 0; i < 10; i++) {
+              await new Promise(r => setTimeout(r, 200));
+              if (isPluginConnected()) {
+                console.log('[daemon] Plugin reconnected, retrying...');
+                break;
+              }
+            }
+          }
+
+          // For Yolo Mode: force reconnect
+          if (attempt < MAX_RETRIES && MODE !== 'plugin' && !isPluginConnected()) {
+            console.log('[daemon] Reconnecting CDP before retry...');
             try { cdpClient.close(); } catch {}
             cdpClient = null;
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 200));
           }
         }
       }
@@ -406,6 +508,21 @@ wss.on('connection', (ws) => {
             pending.resolve(msg.result);
           }
         }
+      }
+
+      // Batch result from plugin
+      if (msg.type === 'batch-result') {
+        const pending = pluginPendingRequests.get(msg.id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          pluginPendingRequests.delete(msg.id);
+          pending.resolve(msg.results);
+        }
+      }
+
+      // Keepalive ping from plugin
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
       }
 
       if (msg.type === 'pong') {

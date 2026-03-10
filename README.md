@@ -26,6 +26,7 @@
 
 A CLI that connects directly to Figma Desktop and gives you complete control:
 
+- **shadcn/ui Components** — Generate all 30 official shadcn components with real Lucide icons and variable binding
 - **Design Tokens** — Create variables, collections, modes (Light/Dark), bind to nodes
 - **Create Anything** — Frames, text, shapes, icons (150k+ from Iconify), components
 - **Slots** — Create and manage Figma's new Slots feature for flexible component content
@@ -35,6 +36,95 @@ A CLI that connects directly to Figma Desktop and gives you complete control:
 - **Export** — PNG, SVG, JSX, Storybook stories, CSS variables, Tailwind config
 - **Batch Operations** — Rename layers, find/replace text, create 100 variables at once
 - **Works with Claude Code** — Just ask in natural language, Claude knows all commands
+
+---
+
+## shadcn/ui Component Package
+
+Generate production-ready shadcn/ui components directly in Figma. All 30 components with 58 variants, matching the official shadcn/ui specs.
+
+### Quick Start
+
+```bash
+# 1. Add shadcn design tokens (Light/Dark mode)
+node src/index.js tokens preset shadcn
+
+# 2. Generate all components
+node src/index.js shadcn add --all
+
+# Or pick specific ones
+node src/index.js shadcn add button card input tabs
+
+# List available components
+node src/index.js shadcn list
+```
+
+### What You Get
+
+**30 components, 58 variants:**
+
+| Component | Variants |
+|-----------|----------|
+| Button | Default, Secondary, Destructive, Outline, Ghost, Link, Small, Large, Icon |
+| Badge | Default, Secondary, Destructive, Outline |
+| Card | Full card with Header, Content, Footer |
+| Input | Default, Filled, With Label |
+| Textarea | Default |
+| Label | Default |
+| Alert | Default (info icon), Destructive (alert icon) |
+| Avatar | Default, Small |
+| Switch | On, Off |
+| Separator | Horizontal, Vertical |
+| Skeleton | Text, Circle, Card |
+| Progress | 60%, 30% |
+| Toggle | Default, Active |
+| Checkbox | Unchecked, Checked (with check icon) |
+| Tabs | Full tabs with content panel |
+| Table | Header + 3 rows |
+| Radio Group | Unchecked, Checked, Full group |
+| Select | Closed, Filled, Open (with dropdown + check icon) |
+| Slider | With thumb |
+| Breadcrumb | With chevron separators |
+| Pagination | With chevron + ellipsis icons |
+| Kbd | Single key, Key combo |
+| Spinner | Small, Medium |
+| Tooltip | Tooltip + trigger |
+| Dialog | With close button, form fields |
+| Dropdown Menu | With items + separator |
+| Accordion | Open + collapsed items |
+| Navigation Menu | Active + inactive items |
+| Sheet | Side panel with form |
+| Hover Card | Profile card |
+
+### Real Lucide Icons
+
+Components use actual Lucide SVG icons (not placeholder shapes), fetched from the Iconify API and rendered as vector nodes in Figma:
+
+- **Pagination**: chevron-left, chevron-right, ellipsis
+- **Select**: chevron-down, chevron-up, check
+- **Accordion**: chevron-down, chevron-right
+- **Checkbox**: check
+- **Dialog/Sheet**: x (close button)
+- **Alert**: info, alert-circle
+- **Button/Icon**: plus
+- **Toggle**: bold
+- **Breadcrumb**: chevron-right
+- **Navigation Menu**: chevron-down
+
+### Design Token Integration
+
+All components use `var:` syntax to bind directly to shadcn variables. When you add tokens with `tokens preset shadcn`, components automatically use your Light/Dark mode colors:
+
+- `background`, `foreground` — page background/text
+- `card`, `card-foreground` — card backgrounds
+- `primary`, `primary-foreground` — buttons, accents
+- `secondary`, `secondary-foreground` — secondary actions
+- `muted`, `muted-foreground` — subtle text, disabled states
+- `accent`, `accent-foreground` — hover states
+- `destructive`, `destructive-foreground` — error states
+- `border`, `input`, `ring` — borders, inputs, focus rings
+
+---
 
 ## Why This CLI?
 
@@ -46,7 +136,7 @@ This project includes a `CLAUDE.md` file that Claude reads automatically. It con
 
 **Want to teach Claude new tricks?** Just update `CLAUDE.md`. No code changes needed.
 
-**Example:** You type "Create Tailwind colors" → Claude already knows to run `node src/index.js tokens tailwind` because it's documented in `CLAUDE.md`.
+**Example:** You type "Create Tailwind colors" -> Claude already knows to run `node src/index.js tokens tailwind` because it's documented in `CLAUDE.md`.
 
 ---
 
@@ -56,7 +146,7 @@ This project includes a `CLAUDE.md` file that Claude reads automatically. It con
 - **Figma Desktop** (free account works)
 - **Claude Code** ([get it here](https://www.anthropic.com/claude-code))
 - **macOS or Windows** (macOS recommended, Windows supported)
-- **macOS Full Disk Access** for Terminal (Yolo Mode only — not needed for [Safe Mode](#-safe-mode--for-restricted-environments))
+- **macOS Full Disk Access** for Terminal (Yolo Mode only -- not needed for [Safe Mode](#-safe-mode--for-restricted-environments))
 
 ---
 
@@ -121,7 +211,9 @@ Once connected, just talk to Claude:
 
 > "Add shadcn colors to my project"
 
-> "Add a card component"
+> "Add all shadcn components"
+
+> "Add a card component with button and input"
 
 > "Check accessibility"
 
@@ -130,6 +222,30 @@ Once connected, just talk to Claude:
 The included `CLAUDE.md` teaches Claude all commands automatically. No manual required.
 
 **Safe Mode users:** Start the FigCli plugin each time you open Figma.
+
+---
+
+## JSX Rendering with Icons
+
+The CLI includes a JSX-like syntax for creating complex layouts. Icons are rendered as real SVG vectors:
+
+```jsx
+// Real Lucide icons in JSX
+<Frame name="Nav" flex="row" items="center" gap={8} bg="var:card" p={12} rounded={8}>
+  <Icon name="lucide:home" size={20} color="var:foreground" />
+  <Text size={14} weight="medium" color="var:foreground">Home</Text>
+  <Frame grow={1} />
+  <Icon name="lucide:settings" size={20} color="var:muted-foreground" />
+</Frame>
+```
+
+Icons support:
+- Any icon from [Lucide](https://lucide.dev/icons) (2000+ icons)
+- Any icon set on [Iconify](https://iconify.design/) (150,000+ icons): `mdi:home`, `heroicons:star`, etc.
+- Variable color binding with `var:` syntax
+- Custom sizes
+
+---
 
 ## Two Connection Modes
 
@@ -148,7 +264,7 @@ The included `CLAUDE.md` teaches Claude all commands automatically. No manual re
 
 ```
 ┌─────────────┐      WebSocket (CDP)      ┌─────────────┐
-│     CLI     │ ◄───────────────────────► │   Figma     │
+│     CLI     │ <------------------------> │   Figma     │
 └─────────────┘    localhost:random port  └─────────────┘
 ```
 
@@ -158,7 +274,7 @@ node src/index.js connect
 
 ---
 
-### 🔒 Safe Mode — For Restricted Environments
+### 🔒 Safe Mode -- For Restricted Environments
 
 **What it does:** Uses a Figma plugin to communicate. No Figma modification needed.
 
@@ -174,7 +290,7 @@ node src/index.js connect
 
 ```
 ┌─────────────┐     WebSocket     ┌─────────────┐     Plugin API     ┌─────────────┐
-│     CLI     │ ◄───────────────► │   Daemon    │ ◄────────────────► │   Plugin    │
+│     CLI     │ <---------------> │   Daemon    │ <----------------> │   Plugin    │
 └─────────────┘   localhost:3456  └─────────────┘                    └─────────────┘
 ```
 
@@ -185,15 +301,15 @@ fig-start --safe
 Or manually: `node src/index.js connect --safe`
 
 **Step 2:** Import plugin (one-time only)
-1. In Figma: **Plugins → Development → Import plugin from manifest**
+1. In Figma: **Plugins -> Development -> Import plugin from manifest**
 2. Select `plugin/manifest.json` from this project
 3. Click **Open**
 
 **Step 3:** Start the plugin (each session)
-1. In Figma: **Plugins → Development → FigCli**
+1. In Figma: **Plugins -> Development -> FigCli**
 2. Terminal shows: `Plugin connected!`
 
-**Tip:** Right-click the plugin → **Add to toolbar** for quick access.
+**Tip:** Right-click the plugin -> **Add to toolbar** for quick access.
 
 ---
 
@@ -221,7 +337,7 @@ If you see `EPERM: operation not permitted, open '.../app.asar'`:
 
 macOS blocks file access without this permission, even with sudo.
 
-1. Open **System Settings** → **Privacy & Security** → **Full Disk Access**
+1. Open **System Settings** -> **Privacy & Security** -> **Full Disk Access**
 2. Click the **+** button
 3. Add **Terminal** (or iTerm, VS Code, Warp, etc.)
 4. **Restart Terminal completely** (quit and reopen)
@@ -293,7 +409,7 @@ Connects to Figma Desktop via Chrome DevTools Protocol (CDP). No API key needed 
 
 ```
 ┌─────────────┐      WebSocket (CDP)      ┌─────────────┐
-│ figma-ds-cli │ ◄───────────────────────► │   Figma     │
+│ figma-ds-cli │ <------------------------> │   Figma     │
 │    (CLI)    │   localhost:9222-9322     │  Desktop    │
 └─────────────┘      (random port)        └─────────────┘
 ```
@@ -314,9 +430,16 @@ Token is stored at `~/.figma-ds-cli/.daemon-token` with owner-only permissions (
 
 ## Full Feature List
 
+### shadcn/ui Components
+
+- **30 components, 58 variants** matching official shadcn/ui specs
+- Real **Lucide SVG icons** (chevrons, check, x, plus, info, alert-circle, bold, ellipsis)
+- **Design token binding** via `var:` syntax (auto-binds to shadcn Light/Dark mode variables)
+- Components: Button (9), Badge (4), Card, Input (3), Textarea, Label, Alert (2), Avatar (2), Switch (2), Separator (2), Skeleton (3), Progress (2), Toggle (2), Checkbox (2), Tabs, Table, Radio Group (3), Select (3), Slider, Breadcrumb, Pagination, Kbd (2), Spinner (2), Tooltip, Dialog, Dropdown Menu, Accordion, Navigation Menu, Sheet, Hover Card
+
 ### Design Tokens & Variables
 
-- **Color presets** — shadcn (276 vars with Light/Dark mode), Radix UI (156 vars)
+- **Color presets** -- shadcn (276 vars with Light/Dark mode), Radix UI (156 vars)
 - Create Tailwind CSS color palettes (all 22 color families, 50-950 shades)
 - Create and manage variable collections
 - **Variable modes** (Light/Dark/Mobile) with per-mode values
@@ -337,6 +460,16 @@ Token is stored at `~/.figma-ds-cli/.daemon-token` with owner-only permissions (
 - Components from frames
 - Component instances
 - **Component sets with variants**
+
+### JSX Rendering
+
+- **JSX-like syntax** for complex layouts (`<Frame>`, `<Text>`, `<Icon>`, `<Slot>`)
+- **Real Lucide/Iconify icons** rendered as SVG vectors (not placeholders)
+- **Variable binding** with `var:name` syntax for fills, strokes, text colors, icon colors
+- Auto-layout props: `flex`, `gap`, `p`/`px`/`py`, `justify`, `items`, `grow`, `wrap`
+- Sizing: `w`/`h` (fixed), `w="fill"` (stretch), auto-hug
+- Appearance: `bg`, `stroke`, `strokeWidth`, `strokeAlign`, `rounded`, `shadow`, `opacity`, `overflow`
+- **Slots** for component content areas
 
 ### Modify Elements
 
@@ -415,25 +548,25 @@ Token is stored at `~/.figma-ds-cli/.daemon-token` with owner-only permissions (
 
 ### Query & Analysis
 
-- **Analyze colors** — usage frequency, variable bindings
-- **Analyze typography** — all font combinations used
-- **Analyze spacing** — gap/padding values, grid compliance
-- **Find clusters** — detect repeated patterns (potential components)
-- **Visual diff** — compare two nodes
-- **Create diff patch** — structural patches between versions
+- **Analyze colors** -- usage frequency, variable bindings
+- **Analyze typography** -- all font combinations used
+- **Analyze spacing** -- gap/padding values, grid compliance
+- **Find clusters** -- detect repeated patterns (potential components)
+- **Visual diff** -- compare two nodes
+- **Create diff patch** -- structural patches between versions
 
 ### Lint & Accessibility
 
 - **Design linting** with 8+ rules:
-  - `no-default-names` — detect unnamed layers
-  - `no-deeply-nested` — flag excessive nesting
-  - `no-empty-frames` — find empty frames
-  - `prefer-auto-layout` — suggest auto-layout
-  - `no-hardcoded-colors` — check variable usage
-  - `color-contrast` — WCAG AA/AAA compliance
-  - `touch-target-size` — minimum 44x44 check
-  - `min-text-size` — minimum 12px text
-- **Accessibility snapshot** — extract interactive elements tree
+  - `no-default-names` -- detect unnamed layers
+  - `no-deeply-nested` -- flag excessive nesting
+  - `no-empty-frames` -- find empty frames
+  - `prefer-auto-layout` -- suggest auto-layout
+  - `no-hardcoded-colors` -- check variable usage
+  - `color-contrast` -- WCAG AA/AAA compliance
+  - `touch-target-size` -- minimum 44x44 check
+  - `min-text-size` -- minimum 12px text
+- **Accessibility snapshot** -- extract interactive elements tree
 
 ### Component Variants
 
@@ -472,7 +605,7 @@ Token is stored at `~/.figma-ds-cli/.daemon-token` with owner-only permissions (
 
 ### Not Supported (requires REST API)
 
-- Comments (read/write/delete) — requires Figma API key
+- Comments (read/write/delete) -- requires Figma API key
 - Version history
 - Team/project management
 
@@ -480,11 +613,11 @@ Token is stored at `~/.figma-ds-cli/.daemon-token` with owner-only permissions (
 
 ## Author
 
-**[Sil Bormüller](https://www.linkedin.com/in/silbormueller/)** — [intodesignsystems.com](https://intodesignsystems.com)
+**[Sil Bormueller](https://www.linkedin.com/in/silbormueller/)** -- [intodesignsystems.com](https://intodesignsystems.com)
 
 ## Powered By
 
-This CLI is built on top of **[figma-use](https://github.com/dannote/figma-use)** by [dannote](https://github.com/dannote) — an excellent Figma CLI with JSX rendering, XPath queries, design linting, and much more.
+This CLI is built on top of **[figma-use](https://github.com/dannote/figma-use)** by [dannote](https://github.com/dannote) -- an excellent Figma CLI with JSX rendering, XPath queries, design linting, and much more.
 
 In **Yolo Mode**, we use figma-use for:
 - JSX rendering (`render` command)

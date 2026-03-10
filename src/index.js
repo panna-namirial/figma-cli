@@ -16,6 +16,7 @@ import { FigmaClient } from './figma-client.js';
 import { isPatched, patchFigma, unpatchFigma, getFigmaCommand, getCdpPort, getFigmaBinaryPath } from './figma-patch.js';
 import { buildDSContext, fetchComponents, fetchLibraryVariables, loadDSCache, loadEnv as loadDSEnv, findVariable, findComponent, getColorVariables } from './ds-context.js';
 import { DS_COLLECTIONS, DS_COMPONENTS } from './ds-config.js';
+import { listComponents, getComponent, getAllComponents, VISUAL_COMPONENTS } from './shadcn.js';
 
 // Daemon configuration
 const DAEMON_PORT = 3456;
@@ -40,8 +41,34 @@ function getDaemonToken() {
   }
 }
 
-// Check if daemon is running
-function isDaemonRunning() {
+// Get detailed token status for debugging
+function getTokenStatus() {
+  const configDir = join(homedir(), '.figma-ds-cli');
+  const tokenPath = DAEMON_TOKEN_FILE;
+  const status = {
+    configDir,
+    tokenPath,
+    configDirExists: existsSync(configDir),
+    tokenFileExists: existsSync(tokenPath),
+    token: null,
+    tokenPreview: null
+  };
+
+  if (status.tokenFileExists) {
+    try {
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      status.token = token;
+      status.tokenPreview = token.slice(0, 8) + '...' + token.slice(-8);
+    } catch (e) {
+      status.readError = e.message;
+    }
+  }
+
+  return status;
+}
+
+// Check if daemon is running (returns object with details, or false)
+function isDaemonRunning(returnDetails = false) {
   try {
     const token = getDaemonToken();
     const tokenHeader = token ? ` -H "X-Daemon-Token: ${token}"` : '';
@@ -50,8 +77,25 @@ function isDaemonRunning() {
       stdio: 'pipe',
       timeout: 1000
     });
-    return response.trim() === '200';
-  } catch {
+    const statusCode = response.trim();
+
+    if (returnDetails) {
+      return {
+        running: statusCode === '200',
+        statusCode,
+        hasToken: !!token,
+        authFailed: statusCode === '403'
+      };
+    }
+    return statusCode === '200';
+  } catch (e) {
+    if (returnDetails) {
+      return {
+        running: false,
+        error: e.message,
+        hasToken: !!getDaemonToken()
+      };
+    }
     return false;
   }
 }
@@ -60,7 +104,23 @@ function isDaemonRunning() {
 async function daemonExec(action, data = {}, timeoutMs = 90000) {
   const token = getDaemonToken();
   const headers = { 'Content-Type': 'application/json' };
-  if (token) headers['X-Daemon-Token'] = token;
+
+  // Fail fast with clear error if token is missing
+  if (!token) {
+    const status = getTokenStatus();
+    if (!status.tokenFileExists) {
+      throw new Error(
+        `Daemon token not found at ${DAEMON_TOKEN_FILE}\n` +
+        `Run "node src/index.js connect" to start the daemon and generate a token.`
+      );
+    }
+    throw new Error(
+      `Failed to read daemon token from ${DAEMON_TOKEN_FILE}\n` +
+      `${status.readError || 'Unknown error'}`
+    );
+  }
+
+  headers['X-Daemon-Token'] = token;
 
   try {
     const response = await fetch(`http://localhost:${DAEMON_PORT}/exec`, {
@@ -76,6 +136,14 @@ async function daemonExec(action, data = {}, timeoutMs = 90000) {
       try {
         const errObj = JSON.parse(text);
         if (errObj.error) {
+          // Enhance auth errors with helpful info
+          if (errObj.error.includes('Unauthorized') || errObj.error.includes('token')) {
+            throw new Error(
+              `${errObj.error}\n` +
+              `Token file: ${DAEMON_TOKEN_FILE}\n` +
+              `Try: node src/index.js daemon restart`
+            );
+          }
           // Clean up error: remove stack trace line numbers for cleaner output
           const cleanError = errObj.error.split('\n')[0];
           throw new Error(cleanError);
@@ -151,14 +219,24 @@ function startDaemon(forceRestart = false, mode = 'auto') {
   // If force restart, always kill existing daemon first
   if (forceRestart) {
     stopDaemon();
-    // Wait for port to be released
-    try { execSync('sleep 0.3', { stdio: 'pipe' }); } catch {}
+    // Wait longer for port to be released (0.3s was too short)
+    try { execSync('sleep 0.5', { stdio: 'pipe' }); } catch {}
+
+    // Double-check port is free
+    try {
+      const portCheck = execSync(`lsof -ti:${DAEMON_PORT} 2>/dev/null || true`, { encoding: 'utf8', stdio: 'pipe' });
+      if (portCheck.trim()) {
+        // Port still in use, wait more and force kill
+        try { execSync(`lsof -ti:${DAEMON_PORT} | xargs kill -9 2>/dev/null || true`, { stdio: 'pipe' }); } catch {}
+        try { execSync('sleep 0.3', { stdio: 'pipe' }); } catch {}
+      }
+    } catch {}
   } else if (isDaemonRunning()) {
     return true; // Already running
   }
 
   // Generate session token before spawning daemon
-  generateDaemonToken();
+  const newToken = generateDaemonToken();
 
   const daemonScript = join(dirname(fileURLToPath(import.meta.url)), 'daemon.js');
   const child = spawn('node', [daemonScript], {
@@ -1649,30 +1727,98 @@ const daemon = program
 daemon
   .command('status')
   .description('Check if daemon is running')
-  .action(() => {
-    if (isDaemonRunning()) {
-      console.log(chalk.green('✓ Daemon is running on port ' + DAEMON_PORT));
+  .option('--debug', 'Show detailed token and connection info')
+  .action((options) => {
+    const details = isDaemonRunning(true);
+    const tokenStatus = getTokenStatus();
+
+    if (options.debug) {
+      console.log(chalk.bold('\nDaemon Status'));
+      console.log(chalk.gray('─'.repeat(50)));
+
+      // Connection status
+      if (details.running) {
+        console.log(chalk.green('✓ Daemon:    ') + 'Running on port ' + DAEMON_PORT);
+      } else if (details.authFailed) {
+        console.log(chalk.red('✗ Daemon:    ') + 'Running but authentication failed (403)');
+      } else if (details.error) {
+        console.log(chalk.yellow('○ Daemon:    ') + 'Not responding');
+      } else {
+        console.log(chalk.yellow('○ Daemon:    ') + 'Not running');
+      }
+
+      // Token status
+      console.log();
+      console.log(chalk.bold('Token Info'));
+      console.log(chalk.gray('  Config dir:   ') + tokenStatus.configDir);
+      console.log(chalk.gray('  Token file:   ') + tokenStatus.tokenPath);
+      console.log(chalk.gray('  Dir exists:   ') + (tokenStatus.configDirExists ? chalk.green('Yes') : chalk.red('No')));
+      console.log(chalk.gray('  File exists:  ') + (tokenStatus.tokenFileExists ? chalk.green('Yes') : chalk.red('No')));
+
+      if (tokenStatus.tokenPreview) {
+        console.log(chalk.gray('  Token:        ') + tokenStatus.tokenPreview);
+      } else if (tokenStatus.readError) {
+        console.log(chalk.red('  Read error:   ') + tokenStatus.readError);
+      }
+
+      // Troubleshooting
+      if (details.authFailed) {
+        console.log();
+        console.log(chalk.yellow('⚠ Token mismatch detected'));
+        console.log(chalk.gray('  The daemon has a different token than the CLI.'));
+        console.log(chalk.gray('  Fix: ') + chalk.cyan('node src/index.js daemon restart'));
+      } else if (!tokenStatus.tokenFileExists && !details.running) {
+        console.log();
+        console.log(chalk.yellow('⚠ No token file found'));
+        console.log(chalk.gray('  Fix: ') + chalk.cyan('node src/index.js connect'));
+      }
+
+      console.log();
     } else {
-      console.log(chalk.yellow('○ Daemon is not running'));
-      console.log(chalk.gray('  Run "figma-ds-cli connect" to start it automatically'));
+      // Simple output
+      if (details.running) {
+        console.log(chalk.green('✓ Daemon is running on port ' + DAEMON_PORT));
+      } else if (details.authFailed) {
+        console.log(chalk.red('✗ Daemon running but auth failed (token mismatch)'));
+        console.log(chalk.gray('  Fix: node src/index.js daemon restart'));
+        console.log(chalk.gray('  Debug: node src/index.js daemon status --debug'));
+      } else {
+        console.log(chalk.yellow('○ Daemon is not running'));
+        console.log(chalk.gray('  Run "node src/index.js connect" to start it'));
+      }
     }
   });
 
 daemon
   .command('start')
   .description('Start the daemon manually')
-  .action(async () => {
-    if (isDaemonRunning()) {
+  .option('--force', 'Force restart even if already running')
+  .action(async (options) => {
+    const details = isDaemonRunning(true);
+
+    if (details.running && !options.force) {
       console.log(chalk.green('✓ Daemon already running'));
       return;
     }
+
+    if (details.authFailed) {
+      console.log(chalk.yellow('⚠ Daemon running but auth failed, forcing restart...'));
+      options.force = true;
+    }
+
     console.log(chalk.blue('Starting daemon...'));
-    startDaemon();
+    startDaemon(options.force, 'auto');
     await new Promise(r => setTimeout(r, 1500));
-    if (isDaemonRunning()) {
+
+    const newDetails = isDaemonRunning(true);
+    if (newDetails.running) {
       console.log(chalk.green('✓ Daemon started on port ' + DAEMON_PORT));
+    } else if (newDetails.authFailed) {
+      console.log(chalk.red('✗ Daemon started but auth failed'));
+      console.log(chalk.gray('  Run: node src/index.js daemon diagnose'));
     } else {
       console.log(chalk.red('✗ Failed to start daemon'));
+      console.log(chalk.gray('  Run: node src/index.js daemon diagnose'));
     }
   });
 
@@ -1687,17 +1833,22 @@ daemon
 
 daemon
   .command('restart')
-  .description('Restart the daemon')
+  .description('Restart the daemon (regenerates token)')
   .action(async () => {
     console.log(chalk.blue('Restarting daemon...'));
-    stopDaemon();
-    await new Promise(r => setTimeout(r, 500));
-    startDaemon();
+    // Use forceRestart=true to ensure clean restart with new token
+    startDaemon(true, 'auto');
     await new Promise(r => setTimeout(r, 1500));
-    if (isDaemonRunning()) {
-      console.log(chalk.green('✓ Daemon restarted'));
+
+    const details = isDaemonRunning(true);
+    if (details.running) {
+      console.log(chalk.green('✓ Daemon restarted with fresh token'));
+    } else if (details.authFailed) {
+      console.log(chalk.red('✗ Daemon running but auth failed'));
+      console.log(chalk.gray('  Try: node src/index.js daemon diagnose'));
     } else {
       console.log(chalk.red('✗ Failed to restart daemon'));
+      console.log(chalk.gray('  Try: node src/index.js daemon diagnose'));
     }
   });
 
@@ -1725,6 +1876,110 @@ daemon
     } catch (e) {
       console.log(chalk.red('✗ Failed: ' + e.message));
     }
+  });
+
+daemon
+  .command('diagnose')
+  .description('Diagnose daemon connection issues')
+  .action(async () => {
+    console.log(chalk.bold('\n🔍 Daemon Diagnostics\n'));
+
+    const tokenStatus = getTokenStatus();
+    const details = isDaemonRunning(true);
+
+    // Step 1: Check token file
+    console.log(chalk.bold('1. Token File'));
+    console.log(chalk.gray('   Path: ') + tokenStatus.tokenPath);
+
+    if (!tokenStatus.configDirExists) {
+      console.log(chalk.red('   ✗ Config directory does not exist'));
+      console.log(chalk.gray('     Fix: Run "node src/index.js connect"'));
+    } else if (!tokenStatus.tokenFileExists) {
+      console.log(chalk.red('   ✗ Token file does not exist'));
+      console.log(chalk.gray('     Fix: Run "node src/index.js connect"'));
+    } else if (tokenStatus.readError) {
+      console.log(chalk.red('   ✗ Cannot read token: ' + tokenStatus.readError));
+    } else {
+      console.log(chalk.green('   ✓ Token exists: ') + tokenStatus.tokenPreview);
+    }
+
+    // Step 2: Check if port is in use
+    console.log();
+    console.log(chalk.bold('2. Port ' + DAEMON_PORT));
+
+    let portPid = null;
+    try {
+      portPid = execSync(`lsof -ti:${DAEMON_PORT} 2>/dev/null || true`, { encoding: 'utf8', stdio: 'pipe' }).trim();
+    } catch {}
+
+    if (portPid) {
+      console.log(chalk.green('   ✓ Port in use by PID: ') + portPid);
+
+      // Check if it matches our PID file
+      let savedPid = null;
+      try {
+        savedPid = readFileSync(DAEMON_PID_FILE, 'utf8').trim();
+      } catch {}
+
+      if (savedPid && savedPid === portPid) {
+        console.log(chalk.green('   ✓ PID matches saved daemon PID'));
+      } else if (savedPid) {
+        console.log(chalk.yellow('   ⚠ PID mismatch! Saved: ' + savedPid + ', Actual: ' + portPid));
+        console.log(chalk.gray('     This may cause auth issues. Fix: "node src/index.js daemon restart"'));
+      }
+    } else {
+      console.log(chalk.yellow('   ○ Port not in use (daemon not running)'));
+    }
+
+    // Step 3: Test authentication
+    console.log();
+    console.log(chalk.bold('3. Authentication'));
+
+    if (!details.running && !details.authFailed) {
+      console.log(chalk.yellow('   ○ Daemon not responding, cannot test auth'));
+    } else if (details.authFailed) {
+      console.log(chalk.red('   ✗ Auth failed (403 Unauthorized)'));
+      console.log(chalk.gray('     The daemon has a different token than the CLI.'));
+      console.log(chalk.gray('     This happens when the daemon was started with an old token.'));
+      console.log(chalk.gray('     Fix: "node src/index.js daemon restart"'));
+    } else if (details.running) {
+      console.log(chalk.green('   ✓ Authentication successful'));
+    }
+
+    // Step 4: Test eval
+    console.log();
+    console.log(chalk.bold('4. Eval Test'));
+
+    if (details.running) {
+      try {
+        const result = await daemonExec('eval', { code: 'return "pong"' }, 5000);
+        if (result === 'pong') {
+          console.log(chalk.green('   ✓ Eval working: ping → pong'));
+        } else {
+          console.log(chalk.yellow('   ⚠ Unexpected result: ' + JSON.stringify(result)));
+        }
+      } catch (e) {
+        console.log(chalk.red('   ✗ Eval failed: ' + e.message.split('\n')[0]));
+      }
+    } else {
+      console.log(chalk.yellow('   ○ Skipped (daemon not running)'));
+    }
+
+    // Summary
+    console.log();
+    console.log(chalk.gray('─'.repeat(50)));
+
+    if (details.running) {
+      console.log(chalk.green('✓ Daemon is healthy'));
+    } else if (details.authFailed) {
+      console.log(chalk.red('✗ Token mismatch - run: node src/index.js daemon restart'));
+    } else if (!tokenStatus.tokenFileExists) {
+      console.log(chalk.red('✗ No token - run: node src/index.js connect'));
+    } else {
+      console.log(chalk.yellow('○ Daemon not running - run: node src/index.js connect'));
+    }
+
+    console.log();
   });
 
 // ============ COLLECTIONS ============
@@ -4748,10 +5003,10 @@ program
       // Check if JSX uses features that require our own renderer:
       // - var:name syntax for variable binding
       // - <Slot> elements for component slots
-      if (jsx.includes('var:') || jsx.includes('<Slot')) {
+      if (jsx.includes('var:') || jsx.includes('<Slot') || jsx.includes('<Icon')) {
         const { FigmaClient } = await import('./figma-client.js');
         const client = new FigmaClient();
-        const code = client.parseJSX(jsx);
+        const code = await client.parseJSX(jsx);
         const result = await daemonExec('eval', { code });
         if (result && result.id) {
           console.log(chalk.green('✓ Rendered: ' + result.id));
@@ -4822,13 +5077,28 @@ program
         await applyPostProcessFixes(result.id, postProcessFixes);
       }
     } catch (e) {
-      console.log(chalk.red('✗ Render failed: ' + (e.stderr || e.message)));
+      const msg = e.stderr || e.message || String(e);
+      // Extract node context from error if available
+      const nodeMatch = msg.match(/\[Node: ([^\]]+)\]/);
+      if (nodeMatch) {
+        console.log(chalk.red('✗ Render failed at ' + chalk.yellow(nodeMatch[1]) + ':'));
+        console.log(chalk.red('  ' + msg.replace(/\[Node: [^\]]+\]\s*/, '')));
+      } else {
+        console.log(chalk.red('✗ Render failed: ' + msg));
+      }
+      // Hint for common errors
+      if (msg.includes('FILL can only be set on children of auto-layout')) {
+        console.log(chalk.yellow('  💡 Hint: w="fill" requires the parent Frame to have flex="row" or flex="col"'));
+      }
+      if (msg.includes('Cannot read properties of null')) {
+        console.log(chalk.yellow('  💡 Hint: A variable binding (var:name) may not exist. Check with: var list'));
+      }
     }
   });
 
 program
   .command('render-batch')
-  .description('Render multiple JSX frames (uses figma-use for full JSX support)')
+  .description('Render multiple JSX frames in a single call (fast)')
   .argument('<jsxArray>', 'JSON array of JSX strings, e.g. \'["<Frame>...</Frame>","<Frame>...</Frame>"]\'')
   .option('-g, --gap <n>', 'Gap between frames', '40')
   .option('-d, --direction <dir>', 'Layout direction: row (horizontal) or col (vertical)', 'row')
@@ -4842,68 +5112,22 @@ program
 
       const gap = parseInt(options.gap) || 40;
       const vertical = options.direction === 'col' || options.direction === 'column' || options.direction === 'vertical';
-      let posX = vertical ? 100 : getNextFreeX(gap);
-      let posY = vertical ? getNextFreeY(gap) : 100;
 
-      const results = [];
+      // Single daemon call for ALL frames (10x faster)
+      const results = await daemonExec('render-batch', {
+        jsxArray,
+        gap,
+        vertical
+      });
 
-      // Check if we're in Safe Mode (plugin only, no CDP)
-      let useDaemon = false;
-      try {
-        const healthToken = getDaemonToken();
-        const healthHeader = healthToken ? ` -H "X-Daemon-Token: ${healthToken}"` : '';
-        const healthRes = execSync(`curl -s${healthHeader} http://127.0.0.1:${DAEMON_PORT}/health`, { encoding: 'utf8', timeout: 2000 });
-        const health = JSON.parse(healthRes);
-        useDaemon = health.plugin && !health.cdp; // Safe Mode: plugin connected, no CDP
-      } catch {}
-
-      if (useDaemon) {
-        console.log(chalk.gray('Using daemon-based rendering (Safe Mode)'));
+      if (Array.isArray(results)) {
+        results.forEach(r => {
+          console.log(chalk.green('✓ Rendered: ' + r.id + (r.name ? ' (' + r.name + ')' : '')));
+        });
+        console.log(chalk.cyan(`\n${results.length} frames created`));
+      } else {
+        console.log(chalk.green('✓ Rendered'));
       }
-
-      // Render each JSX
-      for (const jsx of jsxArray) {
-        let result;
-
-        if (useDaemon) {
-          // Safe Mode: use daemon render (works via plugin)
-          result = await daemonExec('render', { jsx });
-          // Position the frame after creation
-          if (result && result.id) {
-            await fastEval(`(async () => {
-              const n = await figma.getNodeByIdAsync("${result.id}");
-              if (n) { n.x = ${posX}; n.y = ${posY}; }
-            })()`);
-          }
-        } else {
-          // Yolo Mode: use figma-use (full JSX support, faster)
-          const cmd = `figma-use render --stdin --json --x ${posX} --y ${posY}`;
-          const output = execSync(cmd, {
-            input: jsx,
-            encoding: 'utf8',
-            stdio: ['pipe', 'pipe', 'pipe'],
-            timeout: 60000
-          });
-          result = JSON.parse(output.trim());
-        }
-
-        results.push(result);
-        console.log(chalk.green('✓ Rendered: ' + result.id + (result.name ? ' (' + result.name + ')' : '')));
-
-        // Get size for positioning next frame
-        const sizeResult = await fastEval(`(async () => {
-          const n = await figma.getNodeByIdAsync("${result.id}");
-          return n ? { w: n.width, h: n.height } : null;
-        })()`);
-
-
-        if (sizeResult) {
-          if (vertical) posY += sizeResult.h + gap;
-          else posX += sizeResult.w + gap;
-        }
-      }
-
-      console.log(chalk.cyan(`\n${results.length} frames created`));
     } catch (e) {
       console.log(chalk.red('✗ Batch render failed: ' + (e.stderr || e.message)));
     }
@@ -5134,6 +5358,94 @@ return JSON.stringify({ theme: { extend: { colors } } }, null, 2);
 })()`;
     const result = figmaUse(`eval "${code.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`, { silent: true });
     console.log(result);
+  });
+
+// ============ VERIFY (AI Screenshot Check) ============
+
+program
+  .command('verify [nodeId]')
+  .description('Take a small screenshot for AI verification (returns base64 or saves to file)')
+  .option('-s, --scale <number>', 'Export scale (default: 0.5 for small size)', '0.5')
+  .option('--max <pixels>', 'Max dimension in pixels (default: 2000)', '2000')
+  .option('--save [path]', 'Save as PNG file (default: /tmp/figma-verify-{id}.png)')
+  .action((nodeId, options) => {
+    checkConnection();
+    const scale = parseFloat(options.scale);
+    const maxDim = parseInt(options.max);
+
+    const code = `(async () => {
+      let node;
+      ${nodeId ? `node = await figma.getNodeByIdAsync('${nodeId}');` : `
+      const sel = figma.currentPage.selection;
+      node = sel.length > 0 ? sel[0] : null;
+      `}
+      if (!node) return { error: 'No node selected or found' };
+      if (!('exportAsync' in node)) return { error: 'Node cannot be exported' };
+
+      // Calculate optimal scale to stay under max dimension
+      const nodeWidth = node.width || 100;
+      const nodeHeight = node.height || 100;
+      let finalScale = ${scale};
+      const maxNodeDim = Math.max(nodeWidth, nodeHeight);
+      if (maxNodeDim * finalScale > ${maxDim}) {
+        finalScale = ${maxDim} / maxNodeDim;
+      }
+      // Ensure we don't exceed 8000px (API limit)
+      if (maxNodeDim * finalScale > 7500) {
+        finalScale = 7500 / maxNodeDim;
+      }
+
+      const bytes = await node.exportAsync({
+        format: 'PNG',
+        constraint: { type: 'SCALE', value: finalScale }
+      });
+
+      // Convert to base64
+      const base64 = figma.base64Encode(bytes);
+
+      return {
+        name: node.name,
+        id: node.id,
+        width: Math.round(nodeWidth * finalScale),
+        height: Math.round(nodeHeight * finalScale),
+        scale: finalScale,
+        base64: base64
+      };
+    })()`;
+
+    const result = figmaEvalSync(code);
+    if (result.error) {
+      console.error(chalk.red('✗'), result.error);
+      process.exit(1);
+    }
+
+    // Save to file if --save option provided
+    if (options.save !== undefined) {
+      const safeId = result.id.replace(/:/g, '-');
+      const savePath = typeof options.save === 'string'
+        ? options.save
+        : `/tmp/figma-verify-${safeId}.png`;
+
+      const buffer = Buffer.from(result.base64, 'base64');
+      writeFileSync(savePath, buffer);
+
+      console.log(JSON.stringify({
+        name: result.name,
+        id: result.id,
+        width: result.width,
+        height: result.height,
+        saved: savePath
+      }));
+    } else {
+      // Output as JSON for easy parsing
+      console.log(JSON.stringify({
+        name: result.name,
+        id: result.id,
+        width: result.width,
+        height: result.height,
+        base64: result.base64
+      }));
+    }
   });
 
 // ============ EVAL ============
@@ -7394,6 +7706,80 @@ program
 
     } catch (error) {
       spinner.fail('Failed: ' + error.message);
+    }
+  });
+
+// ─── shadcn/ui Component Package ───────────────────────────────────
+const shadcn = program
+  .command('shadcn')
+  .description('Generate shadcn/ui components in Figma (requires: tokens preset shadcn)');
+
+shadcn
+  .command('list')
+  .description('List all available shadcn/ui components')
+  .action(() => {
+    const { available, interactive } = listComponents();
+    console.log(chalk.bold('\n  Available components:\n'));
+    available.forEach(name => {
+      const variants = getComponent(name);
+      console.log(`  ${chalk.green('●')} ${chalk.white(name)} ${chalk.gray(`(${variants.length} variant${variants.length > 1 ? 's' : ''})`)}`);
+    });
+    console.log(chalk.bold('\n  Interactive only (not generated):\n'));
+    console.log(`  ${chalk.gray(interactive.join(', '))}`);
+    console.log();
+  });
+
+shadcn
+  .command('add [names...]')
+  .description('Add shadcn/ui component(s) to Figma canvas')
+  .option('--all', 'Add all components')
+  .action(async (names, options) => {
+    checkConnection();
+
+    let items;
+    if (options.all) {
+      items = getAllComponents();
+    } else if (names && names.length > 0) {
+      items = [];
+      for (const name of names) {
+        const comp = getComponent(name);
+        if (!comp) {
+          console.log(chalk.red(`  ✗ Unknown component: ${name}`));
+          console.log(chalk.gray(`  Available: ${VISUAL_COMPONENTS.join(', ')}`));
+          return;
+        }
+        items.push(...comp);
+      }
+    } else {
+      console.log(chalk.yellow('  Specify component names or use --all'));
+      console.log(chalk.gray(`  Example: node src/index.js shadcn add button badge card`));
+      console.log(chalk.gray(`  Available: ${VISUAL_COMPONENTS.join(', ')}`));
+      return;
+    }
+
+    const spinner = ora(`Creating ${items.length} shadcn/ui component(s)...`).start();
+    let created = 0;
+    let failed = 0;
+
+    for (const item of items) {
+      try {
+        const result = await fastRender(item.jsx);
+        if (result && result.id) {
+          created++;
+          spinner.text = `Created ${created}/${items.length}: ${item.name}`;
+        } else {
+          failed++;
+        }
+      } catch (err) {
+        failed++;
+        spinner.text = `Failed: ${item.name} (${err.message})`;
+      }
+    }
+
+    if (failed === 0) {
+      spinner.succeed(`Created ${created} shadcn/ui component(s)`);
+    } else {
+      spinner.warn(`Created ${created}, failed ${failed}`);
     }
   });
 

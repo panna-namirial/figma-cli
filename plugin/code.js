@@ -12,53 +12,66 @@ figma.showUI(__html__, {
   position: { x: -9999, y: 9999 }  // Bottom-left (push to far left)
 });
 
-// Handle messages from UI (WebSocket bridge)
-figma.ui.onmessage = async (msg) => {
-  if (msg.type === 'eval') {
-    try {
-      // Create async function to support await in eval code
-      // Auto-return: add 'return' for expressions that should return a value
-      let code = msg.code.trim();
+// Execute code with auto-return and timeout protection
+async function executeCode(code, timeoutMs = 25000) {
+  let trimmed = code.trim();
 
-      // Don't add return if code already starts with return
-      if (!code.startsWith('return ')) {
-        // Add return for: simple expressions, IIFEs, arrow IIFEs
-        const isSimpleExpr = !code.includes(';');
-        const isIIFE = code.startsWith('(function') || code.startsWith('(async function');
-        const isArrowIIFE = code.startsWith('(() =>') || code.startsWith('(async () =>');
+  // Don't add return if code already starts with return
+  if (!trimmed.startsWith('return ')) {
+    const isSimpleExpr = !trimmed.includes(';');
+    const isIIFE = trimmed.startsWith('(function') || trimmed.startsWith('(async function');
+    const isArrowIIFE = trimmed.startsWith('(() =>') || trimmed.startsWith('(async () =>');
 
-        if (isSimpleExpr || isIIFE || isArrowIIFE) {
-          code = `return ${code}`;
-        } else {
-          // Multi-statement code: add return to the last statement
-          // Find last statement and add return before it
-          const lastSemicolon = code.lastIndexOf(';');
-          if (lastSemicolon !== -1) {
-            const beforeLast = code.substring(0, lastSemicolon + 1);
-            const lastStmt = code.substring(lastSemicolon + 1).trim();
-            if (lastStmt && !lastStmt.startsWith('return ')) {
-              code = beforeLast + ' return ' + lastStmt;
-            }
-          }
+    if (isSimpleExpr || isIIFE || isArrowIIFE) {
+      trimmed = `return ${trimmed}`;
+    } else {
+      const lastSemicolon = trimmed.lastIndexOf(';');
+      if (lastSemicolon !== -1) {
+        const beforeLast = trimmed.substring(0, lastSemicolon + 1);
+        const lastStmt = trimmed.substring(lastSemicolon + 1).trim();
+        if (lastStmt && !lastStmt.startsWith('return ')) {
+          trimmed = beforeLast + ' return ' + lastStmt;
         }
       }
-      const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
-      const fn = new AsyncFunction('figma', `return (async () => { ${code} })()`);
-      const result = await fn(figma);
-
-      // Send result back to UI -> WebSocket -> CLI
-      figma.ui.postMessage({
-        type: 'result',
-        id: msg.id,
-        result: result
-      });
-    } catch (error) {
-      figma.ui.postMessage({
-        type: 'result',
-        id: msg.id,
-        error: error.message
-      });
     }
+  }
+
+  const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+  const fn = new AsyncFunction('figma', `return (async () => { ${trimmed} })()`);
+
+  // Execute with timeout protection
+  const execPromise = fn(figma);
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Execution timeout (${timeoutMs/1000}s)`)), timeoutMs)
+  );
+
+  return Promise.race([execPromise, timeoutPromise]);
+}
+
+// Handle messages from UI (WebSocket bridge)
+figma.ui.onmessage = async (msg) => {
+  // Single eval
+  if (msg.type === 'eval') {
+    try {
+      const result = await executeCode(msg.code);
+      figma.ui.postMessage({ type: 'result', id: msg.id, result: result });
+    } catch (error) {
+      figma.ui.postMessage({ type: 'result', id: msg.id, error: error.message });
+    }
+  }
+
+  // Batch eval (execute multiple codes in sequence, return all results)
+  if (msg.type === 'eval-batch') {
+    const results = [];
+    for (const code of msg.codes) {
+      try {
+        const result = await executeCode(code);
+        results.push({ success: true, result });
+      } catch (error) {
+        results.push({ success: false, error: error.message });
+      }
+    }
+    figma.ui.postMessage({ type: 'batch-result', id: msg.id, results: results });
   }
 
   if (msg.type === 'connected') {

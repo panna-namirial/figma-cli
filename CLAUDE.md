@@ -30,8 +30,29 @@ CLI that controls Figma Desktop directly. No API key needed.
 | "list project variables" | `node src/index.js var list` |
 | "test accessibility" | `node src/index.js lint` |
 | "compose a page with components" | eval pattern (see Composing Pages section) |
+| "verify creation" | `node src/index.js verify` |
 
 **Full command reference:** See REFERENCE.md
+
+---
+
+## AI Verification (Internal)
+
+After creating any component, run `verify` to get a small screenshot for validation:
+
+```bash
+node src/index.js verify              # Screenshot of selection
+node src/index.js verify "123:456"    # Screenshot of specific node
+```
+
+Returns JSON with base64 image (max 2000px, auto-scaled to stay under API limits).
+
+**Always verify after:**
+- `render` or `render-batch`
+- `node to-component`
+- Any visual creation
+
+This is for internal AI checks, not shown to users.
 
 ---
 
@@ -116,31 +137,80 @@ Then: Plugins → Development → FigCli
 **Safe Mode Notes:**
 - All commands work via daemon (no figma-use dependency)
 - 60s timeout (same as Yolo Mode)
-- For complex screens, use smaller batches or `eval` with native API
-- `render-batch` automatically uses daemon-based rendering
+- **CRITICAL: `render-batch` does NOT render text properly in Safe Mode!**
+- Use `eval` with direct Figma API for components with text
 
 ---
 
-## Creating Components
+## Creating Components (Safe Mode)
 
-When user asks to "create cards", "design buttons":
+**DO NOT use render-batch for components with text in Safe Mode.** Use `eval` with native Figma API:
 
-1. **Each component = separate frame** (NOT inside parent gallery)
-2. **Convert to component** after creation
-3. **Use variables** for colors
+```javascript
+node src/index.js eval "(async () => {
+  // 1. Load fonts FIRST
+  await figma.loadFontAsync({ family: 'Inter', style: 'Bold' });
+  await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
 
+  // 2. Create frame with FIXED width
+  const card = figma.createFrame();
+  card.name = 'Card';
+  card.x = 100; card.y = 100;
+  card.resize(340, 1); // Fixed width!
+  card.layoutMode = 'HORIZONTAL';
+  card.primaryAxisSizingMode = 'FIXED'; // Keep width fixed
+  card.counterAxisSizingMode = 'AUTO';  // Height hugs content
+  card.paddingTop = card.paddingBottom = card.paddingLeft = card.paddingRight = 20;
+  card.itemSpacing = 16;
+  card.cornerRadius = 12;
+  card.fills = [{ type: 'SOLID', color: { r: 0.094, g: 0.094, b: 0.106 } }];
+
+  // 3. Content frame must FILL remaining space
+  const content = figma.createFrame();
+  content.fills = [];
+  content.layoutMode = 'VERTICAL';
+  content.itemSpacing = 4;
+  card.appendChild(content);
+  content.layoutSizingHorizontal = 'FILL'; // Critical!
+
+  // 4. Text must FILL to wrap
+  const title = figma.createText();
+  title.fontName = { family: 'Inter', style: 'Bold' };
+  title.characters = 'Title here';
+  title.fontSize = 14;
+  title.fills = [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }];
+  content.appendChild(title);
+  title.layoutSizingHorizontal = 'FILL'; // Critical!
+
+  // 5. Convert to component
+  const comp = figma.createComponentFromNode(card);
+  return { id: comp.id, name: comp.name };
+})()"
+```
+
+**Auto-Layout Rules (Text Cut-Off Prevention):**
+1. Parent frame needs `resize(WIDTH, 1)` + `primaryAxisSizingMode = 'FIXED'`
+2. Child content frames need `layoutSizingHorizontal = 'FILL'` AFTER appendChild
+3. ALL text nodes need `layoutSizingHorizontal = 'FILL'` AFTER appendChild
+4. Order matters: appendChild first, then set layoutSizingHorizontal
+
+**Before Creating - Check Positions:**
+```javascript
+// Check what's on page to avoid overlap
+const nodes = figma.currentPage.children.map(n => ({
+  name: n.name,
+  x: n.x,
+  width: n.width
+}));
+// Find rightmost edge, place new components after it
+const maxX = Math.max(0, ...nodes.map(n => n.x + n.width)) + 100;
+```
+
+**NEVER delete existing nodes** - users may have components they want to keep!
+
+**After Creating - Always Verify:**
 ```bash
-# Step 1: Create separately
-node src/index.js render-batch '[
-  "<Frame name=\"Card 1\" w={320} h={200} bg=\"#18181b\" rounded={12} flex=\"col\" p={24}><Text color=\"#fff\">Title</Text></Frame>",
-  "<Frame name=\"Card 2\" w={320} h={200} bg=\"#18181b\" rounded={12} flex=\"col\" p={24}><Text color=\"#fff\">Title</Text></Frame>"
-]'
-
-# Step 2: Convert
-node src/index.js node to-component "ID1" "ID2"
-
-# Step 3: Bind variables
-node src/index.js bind fill "zinc/900" -n "ID1"
+node src/index.js verify "NODE_ID"  # Take screenshot and check visually
 ```
 
 ---
@@ -294,6 +364,12 @@ node src/index.js slot create "Content" --flex col --gap 8
 node src/index.js slot preferred "Slot#1:2" "button-comp-id" "icon-comp-id"
 ```
 
+**CRITICAL: `isSlot = true` does NOT work in eval!**
+Setting `frame.isSlot = true` directly in Figma API code will NOT create a slot. You MUST use:
+```bash
+node src/index.js slot convert "frame-id" --name "SlotName"
+```
+
 4. **In instances, slots allow:**
 - Adding any content (or only preferred if set)
 - Reordering children
@@ -346,6 +422,12 @@ rotate={45}             // rotation degrees
 // Text
 <Text size={18} weight="bold" color="#000" font="Inter">Hello</Text>
 <Text color="var:foreground">Text with variable color</Text>
+
+// Icons (Lucide via Iconify API - real SVG nodes, not placeholders)
+<Icon name="lucide:chevron-left" size={16} color="#fff" />
+<Icon name="lucide:check" size={14} color="var:primary-foreground" />
+// Any Lucide icon: lucide:plus, lucide:x, lucide:search, lucide:settings, etc.
+// Full list: https://lucide.dev/icons
 ```
 
 ### Fast Variable Binding (var: syntax)
@@ -572,12 +654,16 @@ text.layoutAlign = "STRETCH";              // Fill available width
 text.layoutGrow = 1;                       // Grow to fill
 ```
 
-**4. No emojis - use shapes as icons:**
+**4. No emojis - use real Lucide icons or shapes:**
 ```jsx
 // BAD: Emojis render inconsistently
 <Text>🏠</Text>
 
-// GOOD: Use shapes as icon placeholders
+// BEST: Use real Lucide icons (fetched as SVG from Iconify API)
+<Icon name="lucide:home" size={20} color="#fff" />
+<Icon name="lucide:settings" size={20} color="var:foreground" />
+
+// OK: Use shapes as fallback icon placeholders
 <Frame w={20} h={20} rounded={4} stroke="#fff" strokeWidth={2} />  // square icon
 <Frame w={20} h={20} rounded={10} stroke="#fff" strokeWidth={2} /> // circle icon
 ```

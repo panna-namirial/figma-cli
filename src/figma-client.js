@@ -279,15 +279,265 @@ export class FigmaClient {
    * Render JSX-like syntax to Figma
    */
   async render(jsx) {
-    // Parse JSX and generate Figma code
-    const code = this.parseJSX(jsx);
+    // Parse JSX and generate Figma code (async for icon fetching)
+    const code = await this.parseJSX(jsx);
     return await this.eval(code);
+  }
+
+  /**
+   * Parse multiple JSX strings into a SINGLE eval call (10x faster)
+   * Returns code that creates all frames and returns array of { id, name }
+   */
+  parseJSXBatch(jsxArray, options = {}) {
+    const gap = options.gap || 40;
+    const vertical = options.vertical || false;
+
+    // Parse each JSX to get props and children
+    const parsed = jsxArray.map(jsx => {
+      const openMatch = jsx.match(/<Frame\s+([^>]*)>/);
+      if (!openMatch) throw new Error('Invalid JSX: must start with <Frame>');
+      const propsStr = openMatch[1];
+      const startIdx = openMatch.index + openMatch[0].length;
+      const children = this.extractContent(jsx.slice(startIdx), 'Frame');
+      const props = this.parseProps(propsStr);
+      const childElements = this.parseChildren(children);
+      return { props, children: childElements };
+    });
+
+    // Collect all fonts needed
+    const allFonts = new Set();
+    let anyUsesVars = false;
+
+    parsed.forEach(({ props, children }) => {
+      const bg = props.bg || props.fill || '#ffffff';
+      const stroke = props.stroke || null;
+      if (this.isVarRef(bg)) anyUsesVars = true;
+      if (stroke && this.isVarRef(stroke)) anyUsesVars = true;
+
+      const collectFonts = (items) => {
+        items.forEach(item => {
+          if (item._type === 'text') {
+            const weight = item.weight || 'regular';
+            const style = weight === 'bold' ? 'Bold' : weight === 'medium' ? 'Medium' : weight === 'semibold' ? 'Semi Bold' : 'Regular';
+            allFonts.add(style);
+            if (item.color && this.isVarRef(item.color)) anyUsesVars = true;
+          } else if (item._type === 'frame') {
+            if (item.bg && this.isVarRef(item.bg)) anyUsesVars = true;
+            if (item.stroke && this.isVarRef(item.stroke)) anyUsesVars = true;
+            if (item._children) collectFonts(item._children);
+          }
+        });
+      };
+      collectFonts(children);
+    });
+
+    // Font caching: only load fonts not yet loaded in this session
+    const fontStyles = Array.from(allFonts);
+    const fontLoads = fontStyles.length > 0
+      ? `
+        if (!globalThis.__loadedFonts) globalThis.__loadedFonts = new Set();
+        const fontsToLoad = ${JSON.stringify(fontStyles)}.filter(s => !globalThis.__loadedFonts.has(s));
+        if (fontsToLoad.length > 0) {
+          await Promise.all(fontsToLoad.map(s => figma.loadFontAsync({family:'Inter',style:s})));
+          fontsToLoad.forEach(s => globalThis.__loadedFonts.add(s));
+        }
+      `
+      : `
+        if (!globalThis.__loadedFonts) globalThis.__loadedFonts = new Set();
+        if (!globalThis.__loadedFonts.has('Regular')) {
+          await figma.loadFontAsync({family:'Inter',style:'Regular'});
+          globalThis.__loadedFonts.add('Regular');
+        }
+      `;
+
+    // Variable caching: reuse loaded vars across calls
+    const varLoadCode = anyUsesVars ? `
+      if (!globalThis.__varsCache || Date.now() - (globalThis.__varsCacheTime || 0) > 30000) {
+        const collections = await figma.variables.getLocalVariableCollectionsAsync();
+        globalThis.__varsCache = {};
+        for (const col of collections) {
+          if (!col.name.startsWith('shadcn')) continue;
+          for (const id of col.variableIds) {
+            const v = await figma.variables.getVariableByIdAsync(id);
+            if (v) globalThis.__varsCache[v.name] = v;
+          }
+        }
+        globalThis.__varsCacheTime = Date.now();
+      }
+      const vars = globalThis.__varsCache;
+      const boundFill = (variable) => figma.variables.setBoundVariableForPaint(
+        { type: 'SOLID', color: { r: 0.5, g: 0.5, b: 0.5 } }, 'color', variable
+      );
+    ` : '';
+
+    // Generate code for each frame
+    const framesCodes = parsed.map(({ props, children }, frameIdx) => {
+      const name = props.name || 'Frame';
+      const hasExplicitWidth = props.w !== undefined || props.width !== undefined;
+      const width = props.w || props.width || 320;
+      const hasExplicitHeight = props.h !== undefined || props.height !== undefined;
+      const height = props.h || props.height || 200;
+      const bg = props.bg || props.fill || '#ffffff';
+      const stroke = props.stroke || null;
+      const rounded = props.rounded || props.radius || 0;
+      const flex = props.flex || 'col';
+      const itemGap = props.gap || 0;
+      const p = props.p || props.padding || 0;
+      const px = props.px || p;
+      const py = props.py || p;
+      const align = props.items || props.align || 'MIN';
+      const justify = props.justify || 'MIN';
+      const wrap = props.wrap === true || props.wrap === 'true';
+      const wrapGap = Number(props.wrapGap || props.counterAxisSpacing || 0);
+      const hug = props.hug || '';
+      const hugWidth = hug === 'both' || hug === 'w' || hug === 'width';
+      const hugHeight = hug === 'both' || hug === 'h' || hug === 'height';
+      const clip = props.clip === 'true' || props.clip === true;
+
+      const alignMap = { start: 'MIN', center: 'CENTER', end: 'MAX', stretch: 'STRETCH' };
+      const alignVal = alignMap[align] || 'MIN';
+      const justifyVal = alignMap[justify] || 'MIN';
+
+      const fillCode = this.generateFillCode(bg, `f${frameIdx}`);
+      const strokeCode = stroke ? this.generateStrokeCode(stroke, `f${frameIdx}`) : { code: '' };
+
+      // Generate child code
+      let childCounter = 0;
+      const generateChildCode = (items, parentVar, parentFlex) => {
+        return items.map(item => {
+          const idx = `${frameIdx}_${childCounter++}`;
+          if (item._type === 'text') {
+            const weight = item.weight || 'regular';
+            const style = weight === 'bold' ? 'Bold' : weight === 'medium' ? 'Medium' : weight === 'semibold' ? 'Semi Bold' : 'Regular';
+            const size = item.size || 14;
+            const color = item.color || '#000000';
+            const fillWidth = item.w === 'fill';
+            const textAlign = item.align || 'left';
+            const textAlignVal = textAlign === 'center' ? 'CENTER' : textAlign === 'right' ? 'RIGHT' : 'LEFT';
+            const textFillCode = this.generateFillCode(color, `el${idx}`);
+            return `
+          const el${idx} = figma.createText();
+          el${idx}.fontName = {family:'Inter',style:'${style}'};
+          el${idx}.characters = ${JSON.stringify(item.content || '')};
+          el${idx}.fontSize = ${size};
+          ${textFillCode.code}
+          el${idx}.textAlignHorizontal = '${textAlignVal}';
+          ${parentVar}.appendChild(el${idx});
+          ${fillWidth ? `el${idx}.layoutSizingHorizontal = 'FILL';` : ''}`;
+          } else if (item._type === 'frame') {
+            const fName = item.name || 'Frame';
+            const fillW = item.w === 'fill';
+            const fillH = item.h === 'fill';
+            const hasExplicitW = (item.w !== undefined || item.width !== undefined) && !fillW;
+            const hasExplicitH = (item.h !== undefined || item.height !== undefined) && !fillH;
+            const fWidth = hasExplicitW ? (item.w || item.width) : 100;
+            const fHeight = hasExplicitH ? (item.h || item.height) : 40;
+            // Frames without explicit bg should be transparent (not white)
+            const fBg = item.bg || item.fill || null;
+            const fStroke = item.stroke || null;
+            const fRounded = item.rounded || item.radius || 0;
+            const fFlex = item.flex || 'row';  // Default to row (always auto-layout like single render)
+            const fGap = item.gap || 0;
+            const fP = item.p !== undefined ? item.p : 0;
+            const fPx = item.px !== undefined ? item.px : fP;
+            const fPy = item.py !== undefined ? item.py : fP;
+            const fPt = item.pt !== undefined ? Number(item.pt) : Number(fPy);
+            const fPr = item.pr !== undefined ? Number(item.pr) : Number(fPx);
+            const fPb = item.pb !== undefined ? Number(item.pb) : Number(fPy);
+            const fPl = item.pl !== undefined ? Number(item.pl) : Number(fPx);
+            const fGrow = item.grow || 0;
+            const fJustify = item.justify || 'center';
+            const fItems = item.items || 'center';
+            const justifyMap = { start: 'MIN', center: 'CENTER', end: 'MAX', between: 'SPACE_BETWEEN' };
+            const fJustifyVal = justifyMap[fJustify] || 'CENTER';
+            const fItemsVal = alignMap[fItems] || 'CENTER';
+            const fFillCode = fBg ? this.generateFillCode(fBg, `el${idx}`) : { code: `el${idx}.fills = [];`, usesVars: false };
+            const fStrokeCode = fStroke ? this.generateStrokeCode(fStroke, `el${idx}`) : { code: '' };
+            const nestedChildren = item._children ? generateChildCode(item._children, `el${idx}`, fFlex) : '';
+            return `
+          const el${idx} = figma.createFrame();
+          el${idx}.name = ${JSON.stringify(fName)};
+          el${idx}.layoutMode = '${fFlex === 'row' ? 'HORIZONTAL' : 'VERTICAL'}';
+          el${idx}.primaryAxisSizingMode = '${hasExplicitW ? 'FIXED' : 'AUTO'}';
+          el${idx}.counterAxisSizingMode = '${hasExplicitH ? 'FIXED' : 'AUTO'}';
+          ${hasExplicitW || hasExplicitH ? `el${idx}.resize(${fWidth}, ${fHeight});` : ''}
+          el${idx}.cornerRadius = ${fRounded};
+          ${fFillCode.code}
+          ${fStrokeCode.code}
+          el${idx}.itemSpacing = ${fGap};
+          el${idx}.paddingTop = ${fPt};
+          el${idx}.paddingBottom = ${fPb};
+          el${idx}.paddingLeft = ${fPl};
+          el${idx}.paddingRight = ${fPr};
+          el${idx}.primaryAxisAlignItems = '${fJustifyVal}';
+          el${idx}.counterAxisAlignItems = '${fItemsVal}';
+          ${parentVar}.appendChild(el${idx});
+          ${fillW ? `el${idx}.layoutSizingHorizontal = 'FILL';` : ''}
+          ${fillH ? `el${idx}.layoutSizingVertical = 'FILL';` : ''}
+          ${fGrow && parentFlex === 'row' ? `el${idx}.layoutSizingHorizontal = 'FILL';` : ''}
+          ${fGrow && parentFlex === 'col' ? `el${idx}.layoutSizingVertical = 'FILL';` : ''}
+          ${nestedChildren}`;
+          }
+          return '';
+        }).join('\n');
+      };
+
+      const childCode = generateChildCode(children, `f${frameIdx}`, flex);
+
+      return `
+        const f${frameIdx} = figma.createFrame();
+        f${frameIdx}.name = ${JSON.stringify(name)};
+        f${frameIdx}.resize(${width}, ${height});
+        f${frameIdx}.x = posX;
+        f${frameIdx}.y = posY;
+        f${frameIdx}.cornerRadius = ${rounded};
+        ${fillCode.code}
+        ${strokeCode.code}
+        f${frameIdx}.layoutMode = '${flex === 'row' ? 'HORIZONTAL' : 'VERTICAL'}';
+        ${wrap && flex === 'row' ? `f${frameIdx}.layoutWrap = 'WRAP';` : ''}
+        f${frameIdx}.itemSpacing = ${itemGap};
+        f${frameIdx}.paddingTop = f${frameIdx}.paddingBottom = ${py};
+        f${frameIdx}.paddingLeft = f${frameIdx}.paddingRight = ${px};
+        f${frameIdx}.primaryAxisAlignItems = '${justifyVal}';
+        f${frameIdx}.counterAxisAlignItems = '${alignVal}';
+        f${frameIdx}.primaryAxisSizingMode = '${flex === 'col' ? (hugHeight || !hasExplicitHeight ? 'AUTO' : 'FIXED') : (hugWidth || !hasExplicitWidth ? 'AUTO' : 'FIXED')}';
+        f${frameIdx}.counterAxisSizingMode = '${flex === 'col' ? (hugWidth || !hasExplicitWidth ? 'AUTO' : 'FIXED') : (hugHeight || !hasExplicitHeight ? 'AUTO' : 'FIXED')}';
+        ${wrap && flex === 'row' && wrapGap > 0 ? `f${frameIdx}.counterAxisSpacing = ${wrapGap};` : ''}
+        f${frameIdx}.clipsContent = ${clip};
+        ${childCode}
+        results.push({ id: f${frameIdx}.id, name: f${frameIdx}.name, width: f${frameIdx}.width, height: f${frameIdx}.height });
+        ${vertical ? `posY += f${frameIdx}.height + ${gap};` : `posX += f${frameIdx}.width + ${gap};`}
+      `;
+    }).join('\n');
+
+    return `
+      (async function() {
+        ${fontLoads}
+        ${varLoadCode}
+
+        // Calculate start position
+        let posX = 0, posY = 100;
+        const children = figma.currentPage.children;
+        if (children.length > 0) {
+          let maxRight = 0;
+          children.forEach(n => {
+            const right = n.x + (n.width || 0);
+            if (right > maxRight) maxRight = right;
+          });
+          posX = Math.round(maxRight + 100);
+        }
+
+        const results = [];
+        ${framesCodes}
+        return results;
+      })()
+    `;
   }
 
   /**
    * Parse JSX-like syntax to Figma Plugin API code
    */
-  parseJSX(jsx) {
+  async parseJSX(jsx) {
     // Find opening Frame tag
     const openMatch = jsx.match(/<Frame\s+([^>]*)>/);
     if (!openMatch) {
@@ -314,8 +564,11 @@ export class FigmaClient {
       console.warn('[render] Supported elements: <Frame>, <Text>, <Rectangle>, <Rect>, <Image>, <Icon>');
     }
 
+    // Pre-fetch any icon SVGs before code generation
+    const iconSvgMap = await this.prefetchIconSvgs(childElements);
+
     // Generate code
-    return this.generateCode(props, childElements);
+    return this.generateCode(props, childElements, iconSvgMap);
   }
 
   /**
@@ -336,14 +589,63 @@ export class FigmaClient {
         }
         i += closeTag.length;
       } else if (remaining.startsWith(`<${tagName} `) || remaining.startsWith(`<${tagName}>`)) {
-        depth++;
-        i++;
+        // Check if this is a self-closing tag (e.g. <Frame ... />)
+        const selfCloseCheck = remaining.match(new RegExp(`^<${tagName}(?:\\s[^>]*?)?\\s*\\/>`));
+        if (selfCloseCheck) {
+          // Self-closing: skip entirely, don't change depth
+          i += selfCloseCheck[0].length;
+        } else {
+          depth++;
+          i++;
+        }
       } else {
         i++;
       }
     }
 
     return str;
+  }
+
+  /**
+   * Collect all icon names from parsed children tree
+   */
+  collectIconNames(items) {
+    const names = new Set();
+    for (const item of items) {
+      if (item._type === 'icon' && item.name && item.name.includes(':')) {
+        names.add(item.name);
+      }
+      if (item._children) {
+        for (const n of this.collectIconNames(item._children)) {
+          names.add(n);
+        }
+      }
+    }
+    return names;
+  }
+
+  /**
+   * Pre-fetch SVGs for all icons in the tree from Iconify API
+   * Returns map: { "lucide:chevron-left": "<svg...>" }
+   */
+  async prefetchIconSvgs(children) {
+    const iconNames = this.collectIconNames(children);
+    if (iconNames.size === 0) return {};
+
+    const svgMap = {};
+    const fetches = [...iconNames].map(async (iconName) => {
+      try {
+        const [prefix, name] = iconName.split(':');
+        const response = await fetch(`https://api.iconify.design/${prefix}/${name}.svg?width=24&height=24`);
+        if (response.ok) {
+          svgMap[iconName] = await response.text();
+        }
+      } catch (e) {
+        // Silently fall back to placeholder
+      }
+    });
+    await Promise.all(fetches);
+    return svgMap;
   }
 
   parseProps(propsStr) {
@@ -366,12 +668,14 @@ export class FigmaClient {
     const children = [];
     const frameRanges = [];
 
-    // Find all nested Frame elements using balanced tag matching
-    // Use \s* to allow frames with or without attributes
+    // First: find all open/close Frame elements (recursive, handles nesting)
     const frameOpenRegex = /<Frame(?:\s+([^>]*?))?>/g;
     let match;
 
     while ((match = frameOpenRegex.exec(childrenStr)) !== null) {
+      // Skip self-closing frames (regex matches /> because > is part of />)
+      if (match[0].endsWith('/>')) continue;
+
       const frameProps = this.parseProps(match[1] || '');
       frameProps._type = 'frame';
       frameProps._index = match.index;
@@ -392,6 +696,22 @@ export class FigmaClient {
 
       // Move regex past this frame to avoid re-matching nested frames
       frameOpenRegex.lastIndex = match.index + fullLength;
+    }
+
+    // Then: parse self-closing Frame elements NOT inside open/close frames
+    const frameSelfCloseRegex = /<Frame(?:\s+([^>]*?))?\s*\/>/g;
+
+    while ((match = frameSelfCloseRegex.exec(childrenStr)) !== null) {
+      // Skip if inside an already-consumed open/close frame
+      const insideFrame = frameRanges.some(r => match.index >= r.start && match.index < r.end);
+      if (insideFrame) continue;
+
+      const frameProps = this.parseProps(match[1] || '');
+      frameProps._type = 'frame';
+      frameProps._index = match.index;
+      frameProps._children = [];
+      children.push(frameProps);
+      frameRanges.push({ start: match.index, end: match.index + match[0].length });
     }
 
     // Parse Slot elements (with children) - must be before Text parsing
@@ -511,25 +831,34 @@ export class FigmaClient {
     return children;
   }
 
-  generateCode(props, children) {
+  generateCode(props, children, iconSvgMap = {}) {
     const name = props.name || 'Frame';
-    const width = props.w || props.width || 320;
-    const height = props.h || props.height || 200;
+    const rawWidth = props.w || props.width;
+    const rawHeight = props.h || props.height;
+    const hasExplicitWidth = props.w !== undefined || props.width !== undefined;
+    const hasExplicitHeight = props.h !== undefined || props.height !== undefined;
+    // Support w="fill" / h="fill" for root frame
+    const fillWidth = rawWidth === 'fill';
+    const fillHeight = rawHeight === 'fill';
+    const width = fillWidth ? 100 : (rawWidth || 320);
+    const height = fillHeight ? 100 : (rawHeight || 200);
     const bg = props.bg || props.fill || '#ffffff';
     const stroke = props.stroke || null;
+    const strokeWidth = props.strokeWidth || 1;
+    const strokeAlignProp = props.strokeAlign || null;
     const rounded = props.rounded || props.radius || 0;
     const flex = props.flex || 'col';
     const gap = props.gap || 0;
     const p = props.p || props.padding || 0;
     const px = props.px || p;
     const py = props.py || p;
-    const align = props.align || 'MIN';
+    const align = props.items || props.align || 'MIN';
     const justify = props.justify || 'MIN';
     const useSmartPos = props.x === undefined;
     const explicitX = props.x || 0;
     const y = props.y || 0;
-    // New: clip defaults to false (don't clip auto-layout overflow)
-    const clip = props.clip === 'true' || props.clip === true;
+    // New: clip defaults to false (don't clip auto-layout overflow). overflow="hidden" also sets clip.
+    const clip = props.clip === 'true' || props.clip === true || props.overflow === 'hidden';
     // New: hug for auto-sizing (hug="both" | "w" | "h" | "width" | "height")
     const hug = props.hug || '';
     const hugWidth = hug === 'both' || hug === 'w' || hug === 'width';
@@ -559,9 +888,9 @@ export class FigmaClient {
           const color = item.color || '#000000';
           checkVarUsage(color);
         } else if (item._type === 'frame') {
-          const fBg = item.bg || item.fill || '#ffffff';
+          const fBg = item.bg || item.fill || null;
           const fStroke = item.stroke || null;
-          checkVarUsage(fBg);
+          if (fBg) checkVarUsage(fBg);
           if (fStroke) checkVarUsage(fStroke);
           if (item._children) collectFontsAndVars(item._children);
         } else if (item._type === 'rect' || item._type === 'image' || item._type === 'icon') {
@@ -572,13 +901,12 @@ export class FigmaClient {
     };
     collectFontsAndVars(children);
 
-    const fontLoads = Array.from(fonts)
-      .map(s => `figma.loadFontAsync({family:'Inter',style:'${s}'})`)
-      .join(',');
+    // Font caching for single render
+    const fontStyles = Array.from(fonts);
 
     // Generate child code recursively
     let childCounter = 0;
-    const generateChildCode = (items, parentVar) => {
+    const generateChildCode = (items, parentVar, parentFlex) => {
       return items.map(item => {
         const idx = childCounter++;
         if (item._type === 'text') {
@@ -590,6 +918,7 @@ export class FigmaClient {
           const textFillCode = this.generateFillCode(color, `el${idx}`);
 
           return `
+        __currentNode = 'Text: ${item.content.substring(0, 30).replace(/'/g, "\\'")}';
         const el${idx} = figma.createText();
         el${idx}.fontName = {family:'Inter',style:'${style}'};
         el${idx}.fontSize = ${size};
@@ -600,19 +929,26 @@ export class FigmaClient {
         } else if (item._type === 'frame') {
           // Nested frame (button, etc.)
           const fName = item.name || 'Nested Frame';
-          const fBg = item.bg || item.fill || '#ffffff';
+          const fBg = item.bg || item.fill || null;
           const fStroke = item.stroke || null;
-          const fRounded = item.rounded || item.radius || 8;
+          const fStrokeWidth = item.strokeWidth || 1;
+          const fStrokeAlign = item.strokeAlign || null;
+          const fRounded = item.rounded || item.radius || 0;
           const fFlex = item.flex || 'row';
           const fGap = item.gap || 0;
-          // Default padding for buttons
+          // Default padding is 0 (only set padding when explicitly specified)
           const fP = item.p !== undefined ? item.p : (item.padding !== undefined ? item.padding : null);
-          const fPx = item.px !== undefined ? item.px : (fP !== null ? fP : 16);
-          const fPy = item.py !== undefined ? item.py : (fP !== null ? fP : 10);
+          const fPx = item.px !== undefined ? item.px : (fP !== null ? fP : 0);
+          const fPy = item.py !== undefined ? item.py : (fP !== null ? fP : 0);
+          // Individual padding overrides (pt, pr, pb, pl)
+          const fPt = item.pt !== undefined ? Number(item.pt) : Number(fPy);
+          const fPr = item.pr !== undefined ? Number(item.pr) : Number(fPx);
+          const fPb = item.pb !== undefined ? Number(item.pb) : Number(fPy);
+          const fPl = item.pl !== undefined ? Number(item.pl) : Number(fPx);
           const fAlign = item.align || 'center';
           const fJustify = item.justify || 'center';
-          // Clip defaults to false for nested frames
-          const fClip = item.clip === 'true' || item.clip === true;
+          // Clip defaults to false for nested frames (overflow="hidden" also sets clip)
+          const fClip = item.clip === 'true' || item.clip === true || item.overflow === 'hidden';
 
           // NEW: wrap, wrapGap, grow, position props
           const fWrap = item.wrap === true || item.wrap === 'true';
@@ -622,40 +958,43 @@ export class FigmaClient {
           const fAbsoluteX = item.x !== undefined ? Number(item.x) : 0;
           const fAbsoluteY = item.y !== undefined ? Number(item.y) : 0;
 
-          // HUG by default, FIXED only if explicit size given
-          const hasWidth = item.w !== undefined || item.width !== undefined;
-          const hasHeight = item.h !== undefined || item.height !== undefined;
-          const fWidth = item.w || item.width || 100;
-          const fHeight = item.h || item.height || 40;
-
-          // Support w="fill" for nested frames
+          // Support w="fill" for nested frames (check BEFORE setting fWidth/fHeight)
           const fillWidth = item.w === 'fill';
           const fillHeight = item.h === 'fill';
+
+          // HUG by default, FIXED only if explicit numeric size given
+          const hasWidth = (item.w !== undefined || item.width !== undefined) && !fillWidth;
+          const hasHeight = (item.h !== undefined || item.height !== undefined) && !fillHeight;
+          const fWidth = fillWidth ? 100 : (item.w || item.width || 100);
+          const fHeight = fillHeight ? 100 : (item.h || item.height || 40);
 
           // Map align/justify to Figma values
           const alignMap = { start: 'MIN', center: 'CENTER', end: 'MAX', stretch: 'STRETCH' };
           const fAlignVal = alignMap[fAlign] || 'CENTER';
           const fJustifyVal = alignMap[fJustify] || 'CENTER';
 
-          const nestedChildren = item._children ? generateChildCode(item._children, `el${idx}`) : '';
-          const frameFillCode = this.generateFillCode(fBg, `el${idx}`);
-          const frameStrokeCode = fStroke ? this.generateStrokeCode(fStroke, `el${idx}`) : { code: '' };
+          const nestedChildren = item._children ? generateChildCode(item._children, `el${idx}`, fFlex) : '';
+          const frameFillCode = fBg ? this.generateFillCode(fBg, `el${idx}`) : { code: `el${idx}.fills = [];`, usesVars: false };
+          const frameStrokeCode = fStroke ? this.generateStrokeCode(fStroke, `el${idx}`, fStrokeWidth, fStrokeAlign) : { code: '' };
+
+          // Determine sizing: FILL, FIXED, or HUG for each axis
+          const wantFillH = fillWidth || (fGrow !== null && parentFlex === 'row');
+          const wantFillV = fillHeight || (fGrow !== null && parentFlex === 'col');
+          const hSizing = wantFillH ? 'FILL' : (hasWidth ? 'FIXED' : 'HUG');
+          const vSizing = wantFillV ? 'FILL' : (hasHeight ? 'FIXED' : 'HUG');
 
           return `
+        __currentNode = 'Frame: ${fName.replace(/'/g, "\\'")}';
         const el${idx} = figma.createFrame();
         el${idx}.name = ${JSON.stringify(fName)};
         el${idx}.layoutMode = '${fFlex === 'row' ? 'HORIZONTAL' : 'VERTICAL'}';
         ${fWrap && fFlex === 'row' ? `el${idx}.layoutWrap = 'WRAP';` : ''}
-        el${idx}.primaryAxisSizingMode = '${hasWidth && !fillWidth ? 'FIXED' : 'AUTO'}';
-        el${idx}.counterAxisSizingMode = '${hasHeight && !fillHeight ? 'FIXED' : 'AUTO'}';
-        ${hasWidth && !fillWidth || hasHeight && !fillHeight ? `el${idx}.resize(${hasWidth ? fWidth : 100}, ${hasHeight ? fHeight : 40});` : ''}
-        ${fillWidth ? `el${idx}.layoutSizingHorizontal = 'FILL';` : ''}
-        ${fillHeight ? `el${idx}.layoutSizingVertical = 'FILL';` : ''}
+        ${hasWidth || hasHeight ? `el${idx}.resize(${hasWidth ? fWidth : 100}, ${hasHeight ? fHeight : 100});` : ''}
         el${idx}.itemSpacing = ${fGap};
-        el${idx}.paddingTop = ${fPy};
-        el${idx}.paddingBottom = ${fPy};
-        el${idx}.paddingLeft = ${fPx};
-        el${idx}.paddingRight = ${fPx};
+        el${idx}.paddingTop = ${fPt};
+        el${idx}.paddingBottom = ${fPb};
+        el${idx}.paddingLeft = ${fPl};
+        el${idx}.paddingRight = ${fPr};
         el${idx}.cornerRadius = ${fRounded};
         ${frameFillCode.code}
         ${frameStrokeCode.code}
@@ -663,9 +1002,10 @@ export class FigmaClient {
         el${idx}.counterAxisAlignItems = '${fAlignVal}';
         el${idx}.clipsContent = ${fClip};
         ${parentVar}.appendChild(el${idx});
+        el${idx}.layoutSizingHorizontal = '${hSizing}';
+        el${idx}.layoutSizingVertical = '${vSizing}';
         ${nestedChildren}
         ${fWrap && fFlex === 'row' && fWrapGap > 0 ? `el${idx}.counterAxisSpacing = ${fWrapGap};` : ''}
-        ${fGrow !== null ? `el${idx}.layoutGrow = ${fGrow};` : ''}
         ${fPosition === 'absolute' ? `el${idx}.layoutPositioning = 'ABSOLUTE'; el${idx}.x = ${fAbsoluteX}; el${idx}.y = ${fAbsoluteY};` : ''}`;
         } else if (item._type === 'rect') {
           // Rectangle element
@@ -700,19 +1040,59 @@ export class FigmaClient {
         ${imgFillCode.code}
         ${parentVar}.appendChild(el${idx});`;
         } else if (item._type === 'icon') {
-          // Icon placeholder (small square)
           const icSize = item.size || item.s || 24;
           const icBg = item.color || item.c || '#71717a';
           const icName = item.name || 'Icon';
-          const iconFillCode = this.generateFillCode(icBg, `el${idx}`);
+          const svgData = iconSvgMap[icName];
 
-          return `
+          if (svgData) {
+            // Real SVG icon from Iconify
+            // IMPORTANT: createNodeFromSvg creates a Frame wrapper. We must:
+            // 1. Clear fills on the wrapper frame (otherwise it shows as a filled square)
+            // 2. Only colorize the vector children inside, not the wrapper
+            const colorCode = icBg.startsWith('var:') ? '' : (() => {
+              const rgb = this.hexToRgb(icBg);
+              return rgb ? `
+            function colorize${idx}(n) {
+              if (n.fills && n.fills.length > 0) n.fills = [{type:'SOLID',color:{r:${rgb.r},g:${rgb.g},b:${rgb.b}}}];
+              if (n.strokes && n.strokes.length > 0) n.strokes = [{type:'SOLID',color:{r:${rgb.r},g:${rgb.g},b:${rgb.b}}}];
+              if (n.children) n.children.forEach(colorize${idx});
+            }
+            if (el${idx}.children) el${idx}.children.forEach(colorize${idx});` : '';
+            })();
+
+            // Variable color binding for icons
+            const varColorCode = icBg.startsWith('var:') ? (() => {
+              const varName = icBg.slice(4);
+              return `
+            if (vars && vars[${JSON.stringify(varName)}]) {
+              function colorizeVar${idx}(n) {
+                if (n.fills && n.fills.length > 0) n.fills = [boundFill(vars[${JSON.stringify(varName)}])];
+                if (n.strokes && n.strokes.length > 0) n.strokes = [figma.variables.setBoundVariableForPaint({type:'SOLID',color:{r:0.5,g:0.5,b:0.5}},'color',vars[${JSON.stringify(varName)}])];
+                if (n.children) n.children.forEach(colorizeVar${idx});
+              }
+              if (el${idx}.children) el${idx}.children.forEach(colorizeVar${idx});
+            }`;
+            })() : '';
+
+            return `
+        const el${idx} = figma.createNodeFromSvg(${JSON.stringify(svgData)});
+        el${idx}.name = ${JSON.stringify(icName)};
+        el${idx}.fills = [];
+        el${idx}.resize(${icSize}, ${icSize});
+        ${colorCode}${varColorCode}
+        ${parentVar}.appendChild(el${idx});`;
+          } else {
+            // Fallback: placeholder rectangle
+            const iconFillCode = this.generateFillCode(icBg, `el${idx}`);
+            return `
         const el${idx} = figma.createRectangle();
         el${idx}.name = ${JSON.stringify(icName)};
         el${idx}.resize(${icSize}, ${icSize});
         el${idx}.cornerRadius = ${Math.round(icSize / 4)};
         ${iconFillCode.code}
         ${parentVar}.appendChild(el${idx});`;
+          }
         } else if (item._type === 'instance') {
           // Component instance
           const compId = item.component || item.id;
@@ -781,7 +1161,7 @@ export class FigmaClient {
       }).join('\n');
     };
 
-    const childCode = generateChildCode(children, 'frame');
+    const childCode = generateChildCode(children, 'frame', flex);
 
     // Map align/justify to Figma values for root frame
     const alignMap = { start: 'MIN', center: 'CENTER', end: 'MAX', stretch: 'STRETCH' };
@@ -804,32 +1184,57 @@ export class FigmaClient {
 
     // Generate fill/stroke code for root frame
     const rootFillCode = this.generateFillCode(bg, 'frame');
-    const rootStrokeCode = stroke ? this.generateStrokeCode(stroke, 'frame') : { code: '', usesVars: false };
+    const rootStrokeCode = stroke ? this.generateStrokeCode(stroke, 'frame', strokeWidth, strokeAlignProp) : { code: '', usesVars: false };
 
-    // Variable loading code (only if any vars used)
+    // Variable loading code with caching (only if any vars used)
     const varLoadCode = usesVars ? `
-        // Load shadcn variables
-        const collections = await figma.variables.getLocalVariableCollectionsAsync();
-        const shadcnCol = collections.find(c => c.name === 'shadcn');
-        const vars = {};
-        if (shadcnCol) {
-          for (const id of shadcnCol.variableIds) {
-            const v = await figma.variables.getVariableByIdAsync(id);
-            if (v) vars[v.name] = v;
+        // Load shadcn variables (cached for 30s)
+        if (!globalThis.__varsCache || Date.now() - (globalThis.__varsCacheTime || 0) > 30000) {
+          const collections = await figma.variables.getLocalVariableCollectionsAsync();
+          globalThis.__varsCache = {};
+          for (const col of collections) {
+            if (!col.name.startsWith('shadcn')) continue;
+            for (const id of col.variableIds) {
+              const v = await figma.variables.getVariableByIdAsync(id);
+              if (v) globalThis.__varsCache[v.name] = v;
+            }
           }
+          globalThis.__varsCacheTime = Date.now();
         }
+        const vars = globalThis.__varsCache;
         const boundFill = (variable) => figma.variables.setBoundVariableForPaint(
           { type: 'SOLID', color: { r: 0.5, g: 0.5, b: 0.5 } }, 'color', variable
         );
     ` : '';
 
+    // Font loading with caching
+    const fontLoadCode = fontStyles.length > 0
+      ? `
+        if (!globalThis.__loadedFonts) globalThis.__loadedFonts = new Set();
+        const fontsToLoad = ${JSON.stringify(fontStyles)}.filter(s => !globalThis.__loadedFonts.has(s));
+        if (fontsToLoad.length > 0) {
+          await Promise.all(fontsToLoad.map(s => figma.loadFontAsync({family:'Inter',style:s})));
+          fontsToLoad.forEach(s => globalThis.__loadedFonts.add(s));
+        }
+      `
+      : `
+        if (!globalThis.__loadedFonts) globalThis.__loadedFonts = new Set();
+        if (!globalThis.__loadedFonts.has('Regular')) {
+          await figma.loadFontAsync({family:'Inter',style:'Regular'});
+          globalThis.__loadedFonts.add('Regular');
+        }
+      `;
+
     return `
       (async function() {
-        await Promise.all([${fontLoads || 'figma.loadFontAsync({family:"Inter",style:"Regular"})'}]);
+        ${fontLoadCode}
         ${varLoadCode}
         ${smartPosCode}
 
+        let __currentNode = 'root';
+        try {
         const frame = figma.createFrame();
+        __currentNode = ${JSON.stringify(name)};
         frame.name = ${JSON.stringify(name)};
         frame.resize(${width}, ${height});
         frame.x = smartX;
@@ -846,16 +1251,37 @@ export class FigmaClient {
         frame.paddingRight = ${px};
         frame.primaryAxisAlignItems = '${justifyVal}';
         frame.counterAxisAlignItems = '${alignVal}';
-        frame.primaryAxisSizingMode = '${hugWidth ? 'AUTO' : 'FIXED'}';
-        frame.counterAxisSizingMode = '${hugHeight ? 'AUTO' : 'FIXED'}';
+        frame.primaryAxisSizingMode = '${flex === 'col' ? (hugHeight || fillHeight || !hasExplicitHeight ? 'AUTO' : 'FIXED') : (hugWidth || fillWidth || !hasExplicitWidth ? 'AUTO' : 'FIXED')}';
+        frame.counterAxisSizingMode = '${flex === 'col' ? (hugWidth || fillWidth || !hasExplicitWidth ? 'AUTO' : 'FIXED') : (hugHeight || fillHeight || !hasExplicitHeight ? 'AUTO' : 'FIXED')}';
+        ${fillWidth ? `frame.layoutSizingHorizontal = 'FILL';` : ''}
+        ${fillHeight ? `frame.layoutSizingVertical = 'FILL';` : ''}
         ${wrap && flex === 'row' && wrapGap > 0 ? `frame.counterAxisSpacing = ${wrapGap};` : ''}
         frame.clipsContent = ${clip};
 
         ${childCode}
 
         return { id: frame.id, name: frame.name };
+        } catch(e) {
+          frame.remove();
+          throw new Error('[Node: ' + __currentNode + '] ' + e.message);
+        }
       })()
     `;
+  }
+
+  hexToRgb(hex) {
+    if (!hex || !hex.startsWith('#')) return null;
+    let r, g, b;
+    if (hex.length === 4) {
+      r = parseInt(hex[1] + hex[1], 16) / 255;
+      g = parseInt(hex[2] + hex[2], 16) / 255;
+      b = parseInt(hex[3] + hex[3], 16) / 255;
+    } else {
+      r = parseInt(hex.slice(1, 3), 16) / 255;
+      g = parseInt(hex.slice(3, 5), 16) / 255;
+      b = parseInt(hex.slice(5, 7), 16) / 255;
+    }
+    return { r, g, b };
   }
 
   hexToRgbCode(hex) {
@@ -911,16 +1337,17 @@ export class FigmaClient {
   /**
    * Generate stroke code - either hex color or bound variable
    */
-  generateStrokeCode(value, elementVar) {
+  generateStrokeCode(value, elementVar, strokeWidth = 1, strokeAlign = null) {
+    const alignCode = strokeAlign ? ` ${elementVar}.strokeAlign = '${strokeAlign.toUpperCase()}';` : '';
     if (this.isVarRef(value)) {
       const varName = this.getVarName(value);
       return {
-        code: `${elementVar}.strokes = [boundFill(vars['${varName}'])]; ${elementVar}.strokeWeight = 1;`,
+        code: `${elementVar}.strokes = [boundFill(vars['${varName}'])]; ${elementVar}.strokeWeight = ${strokeWidth};${alignCode}`,
         usesVars: true
       };
     } else {
       return {
-        code: `${elementVar}.strokes = [{type:'SOLID',color:${this.hexToRgbCode(value)}}]; ${elementVar}.strokeWeight = 1;`,
+        code: `${elementVar}.strokes = [{type:'SOLID',color:${this.hexToRgbCode(value)}}]; ${elementVar}.strokeWeight = ${strokeWidth};${alignCode}`,
         usesVars: false
       };
     }

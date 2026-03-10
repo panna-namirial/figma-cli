@@ -6,6 +6,7 @@
 # Usage:
 #   fig-start          → Yolo Mode (default) with file selector
 #   fig-start --safe   → Safe Mode (plugin-based, no patching)
+#   fig-start --here   → Stay in current directory (don't cd to repo)
 #   fig-start --setup  → set/change the figma-cli repo path
 
 CONFIG_DIR="$HOME/.figma-cli"
@@ -112,10 +113,14 @@ select_file() {
 
 # Handle flags
 SAFE_MODE=false
-if [ "$1" = "--safe" ]; then
-    SAFE_MODE=true
-    shift
-fi
+STAY_HERE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --safe) SAFE_MODE=true ;;
+        --here) STAY_HERE=true ;;
+    esac
+done
 
 if [ "$1" = "--setup" ]; then
     printf "${BOLD}Enter the path to your figma-cli repo:${NC} "
@@ -185,7 +190,9 @@ if [ "$SAFE_MODE" = true ]; then
     # Skip file selector (Safe Mode only sees the active file via plugin)
     echo -e "  ${GREEN}Launching Claude Code...${NC}"
     echo ""
-    cd "$REPO_PATH" || exit 1
+    if [ "$STAY_HERE" = false ]; then
+        cd "$REPO_PATH" || exit 1
+    fi
     exec claude
 else
     # ── Yolo Mode: CDP-based connection ──
@@ -254,7 +261,9 @@ for f in files:
         echo ""
         echo -e "  Launching Claude Code anyway..."
         echo ""
-        cd "$REPO_PATH" || exit 1
+        if [ "$STAY_HERE" = false ]; then
+            cd "$REPO_PATH" || exit 1
+        fi
         exec claude
     fi
 
@@ -270,9 +279,11 @@ for f in files:
     echo -e "  ${GREEN}✓ File: ${BOLD}${SELECTED_TITLE}${NC}"
     echo ""
 
-    # Step 4: Launch Claude Code from repo directory
+    # Step 4: Launch Claude Code
     echo -e "  ${GREEN}Launching Claude Code...${NC}"
     echo ""
-    cd "$REPO_PATH" || exit 1
+    if [ "$STAY_HERE" = false ]; then
+        cd "$REPO_PATH" || exit 1
+    fi
     exec claude
 fi

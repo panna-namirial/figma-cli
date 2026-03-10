@@ -3,3 +3,6 @@
 DEV-NOTES.md
 .env
 .ds-cache.json
+node_modules/
+.figma-client-*.mjs
+screenshot.png
