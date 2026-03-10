@@ -13,7 +13,7 @@ import { homedir, platform } from 'os';
 import { createServer } from 'http';
 import { FigJamClient } from './figjam-client.js';
 import { FigmaClient } from './figma-client.js';
-import { isPatched, patchFigma, unpatchFigma, getFigmaCommand, getCdpPort } from './figma-patch.js';
+import { isPatched, patchFigma, unpatchFigma, getFigmaCommand, getCdpPort, getFigmaBinaryPath } from './figma-patch.js';
 import { buildDSContext, fetchComponents, fetchLibraryVariables, loadDSCache, loadEnv as loadDSEnv, findVariable, findComponent, getColorVariables } from './ds-context.js';
 import { DS_COLLECTIONS, DS_COMPONENTS } from './ds-config.js';
 
@@ -57,21 +57,46 @@ function isDaemonRunning() {
 }
 
 // Send command to daemon (uses native fetch in Node 18+)
-async function daemonExec(action, data = {}) {
+async function daemonExec(action, data = {}, timeoutMs = 90000) {
   const token = getDaemonToken();
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['X-Daemon-Token'] = token;
 
-  const response = await fetch(`http://localhost:${DAEMON_PORT}/exec`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ action, ...data }),
-    signal: AbortSignal.timeout(60000)
-  });
+  try {
+    const response = await fetch(`http://localhost:${DAEMON_PORT}/exec`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action, ...data }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
 
-  const result = await response.json();
-  if (result.error) throw new Error(result.error);
-  return result.result;
+    if (!response.ok) {
+      const text = await response.text();
+      // Try to parse as JSON error from daemon
+      try {
+        const errObj = JSON.parse(text);
+        if (errObj.error) {
+          // Clean up error: remove stack trace line numbers for cleaner output
+          const cleanError = errObj.error.split('\n')[0];
+          throw new Error(cleanError);
+        }
+      } catch (parseErr) {
+        if (parseErr.message && !parseErr.message.includes('JSON')) {
+          throw parseErr; // Re-throw our clean error
+        }
+      }
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    }
+
+    const result = await response.json();
+    if (result.error) throw new Error(result.error);
+    return result.result;
+  } catch (e) {
+    if (e.name === 'TimeoutError' || e.message.includes('timeout')) {
+      throw new Error(`Execution timeout (${timeoutMs/1000}s). Try reconnecting: node src/index.js connect`);
+    }
+    throw e;
+  }
 }
 
 // Fast eval via daemon (falls back to direct connection)
@@ -161,6 +186,19 @@ function stopDaemon() {
     // Also try to kill by port
     if (IS_MAC || IS_LINUX) {
       execSync(`lsof -ti:${DAEMON_PORT} | xargs kill -9 2>/dev/null || true`, { stdio: 'pipe' });
+    } else if (IS_WINDOWS) {
+      // Windows: find process using port and kill it
+      try {
+        const result = execSync(`netstat -ano | findstr :${DAEMON_PORT}`, { encoding: 'utf8', stdio: 'pipe' });
+        const lines = result.split('\n').filter(l => l.includes('LISTENING'));
+        for (const line of lines) {
+          const parts = line.trim().split(/\s+/);
+          const pid = parts[parts.length - 1];
+          if (pid && /^\d+$/.test(pid)) {
+            execSync(`taskkill /PID ${pid} /F 2>nul`, { stdio: 'pipe' });
+          }
+        }
+      } catch {}
     }
   } catch {}
 }
@@ -172,15 +210,8 @@ const IS_LINUX = platform() === 'linux';
 
 // Platform-specific Figma paths and commands
 function getFigmaPath() {
-  if (IS_MAC) {
-    return '/Applications/Figma.app/Contents/MacOS/Figma';
-  } else if (IS_WINDOWS) {
-    const localAppData = process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local');
-    return join(localAppData, 'Figma', 'Figma.exe');
-  } else {
-    // Linux
-    return '/usr/bin/figma';
-  }
+  // Use centralized path detection from figma-patch.js
+  return getFigmaBinaryPath();
 }
 
 function startFigma() {
@@ -210,14 +241,8 @@ function killFigma() {
 }
 
 function getManualStartCommand() {
-  const port = getCdpPort();
-  if (IS_MAC) {
-    return `open -a Figma --args --remote-debugging-port=${port}`;
-  } else if (IS_WINDOWS) {
-    return `"%LOCALAPPDATA%\\Figma\\Figma.exe" --remote-debugging-port=${port}`;
-  } else {
-    return `figma --remote-debugging-port=${port}`;
-  }
+  // Use centralized command from figma-patch.js
+  return getFigmaCommand(getCdpPort());
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -4720,8 +4745,10 @@ program
         posX = getNextFreeX();
       }
 
-      // Check if JSX uses variable syntax (var:name) - use our own renderer
-      if (jsx.includes('var:')) {
+      // Check if JSX uses features that require our own renderer:
+      // - var:name syntax for variable binding
+      // - <Slot> elements for component slots
+      if (jsx.includes('var:') || jsx.includes('<Slot')) {
         const { FigmaClient } = await import('./figma-client.js');
         const client = new FigmaClient();
         const code = client.parseJSX(jsx);
@@ -4750,20 +4777,43 @@ program
       // Extract props that figma-use doesn't handle correctly
       const postProcessFixes = extractPostProcessFixes(jsx);
 
-      // Use figma-use render directly - it has full JSX support
-      let cmd = 'figma-use render --stdin --json';
-      if (options.parent) cmd += ` --parent "${options.parent}"`;
-      if (posX !== undefined) cmd += ` --x ${posX}`;
-      cmd += ` --y ${posY}`;
+      // Check if we're in Safe Mode (plugin only, no CDP)
+      let useDaemonRender = false;
+      try {
+        const healthToken = getDaemonToken();
+        const healthHeader = healthToken ? ` -H "X-Daemon-Token: ${healthToken}"` : '';
+        const healthRes = execSync(`curl -s${healthHeader} http://127.0.0.1:${DAEMON_PORT}/health`, { encoding: 'utf8', timeout: 2000 });
+        const health = JSON.parse(healthRes);
+        useDaemonRender = health.plugin && !health.cdp; // Safe Mode
+      } catch {}
 
-      const output = execSync(cmd, {
-        input: jsx,
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 30000
-      });
+      let result;
+      if (useDaemonRender) {
+        // Safe Mode: use daemon render (works via plugin)
+        result = await daemonExec('render', { jsx });
+        // Position the frame after creation
+        if (result && result.id && (posX !== undefined || posY !== undefined)) {
+          await fastEval(`(async () => {
+            const n = await figma.getNodeByIdAsync("${result.id}");
+            if (n) { ${posX !== undefined ? `n.x = ${posX};` : ''} n.y = ${posY}; }
+          })()`);
+        }
+      } else {
+        // Yolo Mode: use figma-use (full JSX support, faster)
+        let cmd = 'figma-use render --stdin --json';
+        if (options.parent) cmd += ` --parent "${options.parent}"`;
+        if (posX !== undefined) cmd += ` --x ${posX}`;
+        cmd += ` --y ${posY}`;
 
-      const result = JSON.parse(output.trim());
+        const output = execSync(cmd, {
+          input: jsx,
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          timeout: 60000
+        });
+        result = JSON.parse(output.trim());
+      }
+
       console.log(chalk.green('✓ Rendered: ' + result.id));
       if (result.name) console.log(chalk.gray('  name: ' + result.name));
 
@@ -4778,7 +4828,7 @@ program
 
 program
   .command('render-batch')
-  .description('Render multiple JSX frames in a single fast operation')
+  .description('Render multiple JSX frames (uses figma-use for full JSX support)')
   .argument('<jsxArray>', 'JSON array of JSX strings, e.g. \'["<Frame>...</Frame>","<Frame>...</Frame>"]\'')
   .option('-g, --gap <n>', 'Gap between frames', '40')
   .option('-d, --direction <dir>', 'Layout direction: row (horizontal) or col (vertical)', 'row')
@@ -4792,68 +4842,172 @@ program
 
       const gap = parseInt(options.gap) || 40;
       const vertical = options.direction === 'col' || options.direction === 'column' || options.direction === 'vertical';
-      const startX = vertical ? 100 : getNextFreeX(gap);
-      const startY = vertical ? getNextFreeY(gap) : 100;
+      let posX = vertical ? 100 : getNextFreeX(gap);
+      let posY = vertical ? getNextFreeY(gap) : 100;
 
-      // Parse all JSX to code blocks
-      const { FigmaClient } = await import('./figma-client.js');
-      const parser = new FigmaClient();
+      const results = [];
 
-      // Parse each JSX and wrap to capture result
-      const codeBlocks = jsxArray.map(jsx => {
-        const code = parser.parseJSX(jsx);
-        // Wrap the IIFE to capture result, replace smart positioning
-        return code
-          .replace(/let smartX[\s\S]*?smartX = Math\.round\(maxRight \+ 100\);\s*\}\s*/, '')
-          .replace(/frame\.x = smartX;/, 'frame.x = currentX;')
-          .replace(/frame\.y = 0;/, 'frame.y = currentY;');
-      });
+      // Check if we're in Safe Mode (plugin only, no CDP)
+      let useDaemon = false;
+      try {
+        const healthToken = getDaemonToken();
+        const healthHeader = healthToken ? ` -H "X-Daemon-Token: ${healthToken}"` : '';
+        const healthRes = execSync(`curl -s${healthHeader} http://127.0.0.1:${DAEMON_PORT}/health`, { encoding: 'utf8', timeout: 2000 });
+        const health = JSON.parse(healthRes);
+        useDaemon = health.plugin && !health.cdp; // Safe Mode: plugin connected, no CDP
+      } catch {}
 
-      // Build single eval that creates all frames
-      const batchCode = `(async () => {
-        await figma.loadFontAsync({family:"Inter",style:"Regular"});
-        await figma.loadFontAsync({family:"Inter",style:"Medium"});
-        await figma.loadFontAsync({family:"Inter",style:"Semi Bold"});
-        await figma.loadFontAsync({family:"Inter",style:"Bold"});
-
-        const results = [];
-        let currentX = ${startX}, currentY = ${startY};
-        const gap = ${gap};
-        const vertical = ${vertical};
-
-        ${codeBlocks.map((code, i) => `
-        // Frame ${i + 1}
-        {
-          const frameResult = await (async function() {
-            ${code.replace(/^\s*\(async function\(\) \{/, '').replace(/\}\)\(\)\s*$/, '')}
-          })();
-          if (frameResult) {
-            const frame = await figma.getNodeByIdAsync(frameResult.id);
-            if (frame) {
-              frame.x = currentX;
-              frame.y = currentY;
-              results.push({ id: frame.id, name: frame.name });
-              if (vertical) currentY += frame.height + gap;
-              else currentX += frame.width + gap;
-            }
-          }
-        }
-        `).join('\n')}
-
-        return results;
-      })()`;
-
-      const results = await fastEval(batchCode);
-
-      if (Array.isArray(results)) {
-        results.forEach(r => {
-          console.log(chalk.green('✓ Rendered: ' + r.id + (r.name ? ' (' + r.name + ')' : '')));
-        });
-        console.log(chalk.cyan(`\n${results.length} frames created`));
+      if (useDaemon) {
+        console.log(chalk.gray('Using daemon-based rendering (Safe Mode)'));
       }
+
+      // Render each JSX
+      for (const jsx of jsxArray) {
+        let result;
+
+        if (useDaemon) {
+          // Safe Mode: use daemon render (works via plugin)
+          result = await daemonExec('render', { jsx });
+          // Position the frame after creation
+          if (result && result.id) {
+            await fastEval(`(async () => {
+              const n = await figma.getNodeByIdAsync("${result.id}");
+              if (n) { n.x = ${posX}; n.y = ${posY}; }
+            })()`);
+          }
+        } else {
+          // Yolo Mode: use figma-use (full JSX support, faster)
+          const cmd = `figma-use render --stdin --json --x ${posX} --y ${posY}`;
+          const output = execSync(cmd, {
+            input: jsx,
+            encoding: 'utf8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: 60000
+          });
+          result = JSON.parse(output.trim());
+        }
+
+        results.push(result);
+        console.log(chalk.green('✓ Rendered: ' + result.id + (result.name ? ' (' + result.name + ')' : '')));
+
+        // Get size for positioning next frame
+        const sizeResult = await fastEval(`(async () => {
+          const n = await figma.getNodeByIdAsync("${result.id}");
+          return n ? { w: n.width, h: n.height } : null;
+        })()`);
+
+
+        if (sizeResult) {
+          if (vertical) posY += sizeResult.h + gap;
+          else posX += sizeResult.w + gap;
+        }
+      }
+
+      console.log(chalk.cyan(`\n${results.length} frames created`));
     } catch (e) {
-      console.log(chalk.red('✗ Batch render failed: ' + e.message));
+      console.log(chalk.red('✗ Batch render failed: ' + (e.stderr || e.message)));
     }
+  });
+
+// ============ DIAGNOSE ============
+
+program
+  .command('diagnose')
+  .description('Check system compatibility and connection status')
+  .action(async () => {
+    console.log(chalk.cyan('\n🔍 Figma CLI Diagnostics\n'));
+
+    // 1. Node version
+    const nodeVersion = process.version;
+    const nodeMajor = parseInt(nodeVersion.slice(1).split('.')[0]);
+    if (nodeMajor >= 18) {
+      console.log(chalk.green(`✓ Node.js ${nodeVersion}`));
+    } else {
+      console.log(chalk.red(`✗ Node.js ${nodeVersion} (need 18+)`));
+    }
+
+    // 2. Platform
+    const platform = process.platform;
+    const platformNames = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' };
+    console.log(chalk.gray(`  Platform: ${platformNames[platform] || platform}`));
+
+    // 3. Figma version
+    try {
+      let figmaVersion = 'unknown';
+      if (platform === 'darwin') {
+        figmaVersion = execSync('defaults read /Applications/Figma.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null', { encoding: 'utf8' }).trim();
+      } else if (platform === 'win32') {
+        // Windows: check registry or file version
+        figmaVersion = execSync('powershell -command "(Get-Item \\"$env:LOCALAPPDATA\\Figma\\Figma.exe\\").VersionInfo.ProductVersion" 2>nul', { encoding: 'utf8' }).trim() || 'unknown';
+      }
+      const major = parseInt(figmaVersion.split('.')[0]);
+      if (major >= 126) {
+        console.log(chalk.yellow(`⚠ Figma ${figmaVersion} (126+ blocks remote debugging by default)`));
+      } else {
+        console.log(chalk.green(`✓ Figma ${figmaVersion}`));
+      }
+    } catch {
+      console.log(chalk.red('✗ Figma not found'));
+    }
+
+    // 4. Figma running?
+    try {
+      let figmaRunning = false;
+      if (platform === 'darwin' || platform === 'linux') {
+        const ps = execSync('pgrep -f Figma 2>/dev/null || true', { encoding: 'utf8' });
+        figmaRunning = ps.trim().length > 0;
+      } else if (platform === 'win32') {
+        const ps = execSync('tasklist /FI "IMAGENAME eq Figma.exe" 2>nul', { encoding: 'utf8' });
+        figmaRunning = ps.includes('Figma.exe');
+      }
+      if (figmaRunning) {
+        console.log(chalk.green('✓ Figma is running'));
+      } else {
+        console.log(chalk.red('✗ Figma is not running'));
+      }
+    } catch {
+      console.log(chalk.gray('  Could not check if Figma is running'));
+    }
+
+    // 5. Remote debugging port
+    try {
+      const response = await fetch('http://127.0.0.1:9222/json/version', { signal: AbortSignal.timeout(2000) });
+      if (response.ok) {
+        console.log(chalk.green('✓ Remote debugging enabled (port 9222)'));
+      } else {
+        console.log(chalk.red('✗ Remote debugging port not responding'));
+      }
+    } catch {
+      console.log(chalk.red('✗ Remote debugging not available (port 9222 closed)'));
+      console.log(chalk.gray('  → Run: node src/index.js connect'));
+    }
+
+    // 6. Daemon status
+    if (isDaemonRunning()) {
+      console.log(chalk.green('✓ Daemon running on port 3456'));
+    } else {
+      console.log(chalk.yellow('○ Daemon not running (optional, speeds up commands)'));
+    }
+
+    // 7. figma-use availability
+    try {
+      execSync('which figma-use 2>/dev/null || where figma-use 2>nul', { encoding: 'utf8' });
+      console.log(chalk.green('✓ figma-use installed'));
+    } catch {
+      console.log(chalk.yellow('○ figma-use not in PATH (some features limited)'));
+    }
+
+    // 8. Connection test
+    console.log(chalk.gray('\n  Testing connection...'));
+    try {
+      const client = await getFigmaClient();
+      const result = await client.eval('({ file: figma.root.name, page: figma.currentPage.name })');
+      console.log(chalk.green(`✓ Connected to "${result.file}" / "${result.page}"`));
+    } catch (e) {
+      console.log(chalk.red('✗ Connection failed: ' + e.message));
+    }
+
+    console.log('');
   });
 
 // ============ EXPORT ============
@@ -4864,11 +5018,39 @@ const exp = program
 
 exp
   .command('screenshot')
-  .description('Take a screenshot')
+  .description('Take a screenshot of selected node or current page')
   .option('-o, --output <file>', 'Output file', 'screenshot.png')
+  .option('-s, --scale <number>', 'Export scale (1-4)', '2')
+  .option('-f, --format <format>', 'Format: png, jpg, svg, pdf', 'png')
   .action((options) => {
     checkConnection();
-    figmaUse(`export screenshot --output "${options.output}"`);
+    const format = options.format.toUpperCase();
+    const scale = parseFloat(options.scale);
+    const code = `(async () => {
+const sel = figma.currentPage.selection;
+const node = sel.length > 0 ? sel[0] : figma.currentPage;
+if (!node) return { error: 'No page or selection' };
+if (!('exportAsync' in node)) return { error: 'Node cannot be exported' };
+const bytes = await node.exportAsync({ format: '${format}', constraint: { type: 'SCALE', value: ${scale} } });
+return {
+  name: node.name,
+  id: node.id,
+  width: Math.round(node.width * ${scale}),
+  height: Math.round(node.height * ${scale}),
+  bytes: Array.from(bytes)
+};
+})()`;
+    const result = figmaEvalSync(code);
+    if (result.error) {
+      console.error(chalk.red('✗'), result.error);
+      process.exit(1);
+    }
+    const buffer = Buffer.from(result.bytes);
+    const outputFile = options.output === 'screenshot.png' && format !== 'PNG'
+      ? `screenshot.${format.toLowerCase()}`
+      : options.output;
+    writeFileSync(outputFile, buffer);
+    console.log(chalk.green('✓'), `Screenshot: ${result.name} (${result.width}x${result.height}) → ${outputFile}`);
   });
 
 exp
@@ -4978,8 +5160,8 @@ program
       return;
     }
 
-    // Use async daemon for file-based execution (more reliable for long scripts)
-    if (options.file && isDaemonRunning()) {
+    // Always prefer async daemon (more reliable, no shell timeout issues)
+    if (isDaemonRunning()) {
       try {
         const result = await daemonExec('eval', { code: jsCode });
         if (result !== undefined && result !== null) {
@@ -4987,11 +5169,24 @@ program
         }
         return;
       } catch (e) {
-        // Fall through to sync path
+        // Check if this is a connection/daemon error vs user code error
+        const isConnectionError = e.message.includes('ECONNREFUSED') ||
+                                  e.message.includes('fetch failed') ||
+                                  e.message.includes('network') ||
+                                  e.message.includes('timeout') ||
+                                  e.message.includes('disconnected');
+        if (isConnectionError) {
+          // Connection/daemon error - fall back to sync path
+          console.log(chalk.yellow('⚠ Daemon error, trying sync path...'));
+        } else {
+          // User code error - display directly, don't fall back
+          console.log(chalk.red('✗ ' + e.message));
+          return;
+        }
       }
     }
 
-    // Sync path for inline code or fallback
+    // Sync fallback (when daemon not running)
     try {
       const result = figmaEvalSync(jsCode);
       if (result !== undefined && result !== null) {
@@ -5039,23 +5234,90 @@ program
     figmaUse(command.join(' '));
   });
 
-// ============ DESIGN ANALYSIS (figma-use) ============
+// ============ DESIGN ANALYSIS ============
+
+// Helper: Check if Safe Mode (plugin only)
+async function isInSafeMode() {
+  try {
+    const healthToken = getDaemonToken();
+    const healthHeader = healthToken ? ` -H "X-Daemon-Token: ${healthToken}"` : '';
+    const healthRes = execSync(`curl -s${healthHeader} http://127.0.0.1:${DAEMON_PORT}/health`, { encoding: 'utf8', timeout: 2000 });
+    const health = JSON.parse(healthRes);
+    return health.plugin && !health.cdp;
+  } catch {
+    return false;
+  }
+}
 
 program
   .command('lint')
-  .description('Lint design for issues (figma-use)')
+  .description('Lint design for issues')
   .option('--fix', 'Auto-fix issues where possible')
-  .option('--rule <rule>', 'Run specific rule (can be repeated)', (val, prev) => prev ? [...prev, val] : [val])
-  .option('--preset <preset>', 'Preset: recommended, strict, accessibility, design-system')
   .option('--json', 'Output as JSON')
-  .action((options) => {
-    checkConnection();
-    let cmd = 'npx figma-use lint';
-    if (options.fix) cmd += ' --fix';
-    if (options.rule) options.rule.forEach(r => cmd += ` --rule ${r}`);
-    if (options.preset) cmd += ` --preset ${options.preset}`;
-    if (options.json) cmd += ' --json';
-    runFigmaUse(cmd);
+  .action(async (options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      // Safe Mode: native implementation
+      const code = `(async () => {
+        const issues = [];
+        const page = figma.currentPage;
+
+        function checkNode(node, depth = 0) {
+          // Check for missing names
+          if (node.name.startsWith('Frame') || node.name.startsWith('Rectangle') || node.name.startsWith('Group')) {
+            issues.push({ type: 'naming', severity: 'warning', node: node.id, name: node.name, message: 'Generic name, consider renaming' });
+          }
+
+          // Check for hardcoded colors (not bound to variables)
+          if (node.fills && Array.isArray(node.fills)) {
+            const hasFillBinding = node.boundVariables && node.boundVariables.fills;
+            if (!hasFillBinding && node.fills.some(f => f.type === 'SOLID')) {
+              issues.push({ type: 'color', severity: 'info', node: node.id, name: node.name, message: 'Hardcoded fill color' });
+            }
+          }
+
+          // Check text for missing styles
+          if (node.type === 'TEXT' && !node.textStyleId) {
+            issues.push({ type: 'typography', severity: 'info', node: node.id, name: node.name, message: 'Text without style' });
+          }
+
+          // Check for tiny text
+          if (node.type === 'TEXT' && node.fontSize < 12) {
+            issues.push({ type: 'accessibility', severity: 'warning', node: node.id, name: node.name, message: 'Text size < 12px may be hard to read' });
+          }
+
+          // Recurse
+          if ('children' in node) {
+            node.children.forEach(c => checkNode(c, depth + 1));
+          }
+        }
+
+        page.children.forEach(c => checkNode(c));
+        return { total: issues.length, issues: issues.slice(0, 50) }; // Limit output
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(chalk.cyan(`\nFound ${result.total} issues:\n`));
+          result.issues.forEach(i => {
+            const color = i.severity === 'warning' ? chalk.yellow : chalk.gray;
+            console.log(color(`  [${i.type}] ${i.name}: ${i.message}`));
+          });
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Lint failed: ' + e.message));
+      }
+    } else {
+      // Yolo Mode: use figma-use
+      let cmd = 'npx figma-use lint';
+      if (options.fix) cmd += ' --fix';
+      if (options.json) cmd += ' --json';
+      runFigmaUse(cmd);
+    }
   });
 
 const analyze = program
@@ -5066,11 +5328,51 @@ analyze
   .command('colors')
   .description('Analyze color usage')
   .option('--json', 'Output as JSON')
-  .action((options) => {
-    checkConnection();
-    let cmd = 'npx figma-use analyze colors';
-    if (options.json) cmd += ' --json';
-    runFigmaUse(cmd);
+  .action(async (options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const code = `(async () => {
+        const colors = new Map();
+        function rgbToHex(r, g, b) {
+          return '#' + [r, g, b].map(x => Math.round(x * 255).toString(16).padStart(2, '0')).join('');
+        }
+        function checkNode(node) {
+          if (node.fills && Array.isArray(node.fills)) {
+            node.fills.forEach(f => {
+              if (f.type === 'SOLID' && f.color) {
+                const hex = rgbToHex(f.color.r, f.color.g, f.color.b);
+                colors.set(hex, (colors.get(hex) || 0) + 1);
+              }
+            });
+          }
+          if ('children' in node) node.children.forEach(c => checkNode(c));
+        }
+        figma.currentPage.children.forEach(c => checkNode(c));
+        return Array.from(colors.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 20)
+          .map(([hex, count]) => ({ hex, count }));
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(chalk.cyan('\nTop colors used:\n'));
+          result.forEach(c => {
+            console.log(`  ${chalk.hex(c.hex)('██')} ${c.hex} (${c.count}x)`);
+          });
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Analyze failed: ' + e.message));
+      }
+    } else {
+      let cmd = 'npx figma-use analyze colors';
+      if (options.json) cmd += ' --json';
+      runFigmaUse(cmd);
+    }
   });
 
 analyze
@@ -5078,33 +5380,148 @@ analyze
   .alias('type')
   .description('Analyze typography usage')
   .option('--json', 'Output as JSON')
-  .action((options) => {
-    checkConnection();
-    let cmd = 'npx figma-use analyze typography';
-    if (options.json) cmd += ' --json';
-    runFigmaUse(cmd);
+  .action(async (options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const code = `(async () => {
+        const styles = new Map();
+        function checkNode(node) {
+          if (node.type === 'TEXT') {
+            const key = node.fontName.family + '/' + node.fontSize + '/' + node.fontName.style;
+            styles.set(key, (styles.get(key) || 0) + 1);
+          }
+          if ('children' in node) node.children.forEach(c => checkNode(c));
+        }
+        figma.currentPage.children.forEach(c => checkNode(c));
+        return Array.from(styles.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 15)
+          .map(([key, count]) => {
+            const [family, size, style] = key.split('/');
+            return { family, size: parseInt(size), style, count };
+          });
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(chalk.cyan('\nTypography usage:\n'));
+          result.forEach(t => {
+            console.log(`  ${t.family} ${t.size}px ${t.style} (${t.count}x)`);
+          });
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Analyze failed: ' + e.message));
+      }
+    } else {
+      let cmd = 'npx figma-use analyze typography';
+      if (options.json) cmd += ' --json';
+      runFigmaUse(cmd);
+    }
   });
 
 analyze
   .command('spacing')
   .description('Analyze spacing (gap/padding) usage')
   .option('--json', 'Output as JSON')
-  .action((options) => {
-    checkConnection();
-    let cmd = 'npx figma-use analyze spacing';
-    if (options.json) cmd += ' --json';
-    runFigmaUse(cmd);
+  .action(async (options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const code = `(async () => {
+        const gaps = new Map();
+        const paddings = new Map();
+        function checkNode(node) {
+          if (node.layoutMode && node.layoutMode !== 'NONE') {
+            if (node.itemSpacing !== undefined) {
+              gaps.set(node.itemSpacing, (gaps.get(node.itemSpacing) || 0) + 1);
+            }
+            const p = [node.paddingTop, node.paddingRight, node.paddingBottom, node.paddingLeft].filter(x => x > 0);
+            p.forEach(v => paddings.set(v, (paddings.get(v) || 0) + 1));
+          }
+          if ('children' in node) node.children.forEach(c => checkNode(c));
+        }
+        figma.currentPage.children.forEach(c => checkNode(c));
+        return {
+          gaps: Array.from(gaps.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([v, c]) => ({ value: v, count: c })),
+          paddings: Array.from(paddings.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([v, c]) => ({ value: v, count: c }))
+        };
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(chalk.cyan('\nGap values:\n'));
+          result.gaps.forEach(g => console.log(`  ${g.value}px (${g.count}x)`));
+          console.log(chalk.cyan('\nPadding values:\n'));
+          result.paddings.forEach(p => console.log(`  ${p.value}px (${p.count}x)`));
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Analyze failed: ' + e.message));
+      }
+    } else {
+      let cmd = 'npx figma-use analyze spacing';
+      if (options.json) cmd += ' --json';
+      runFigmaUse(cmd);
+    }
   });
 
 analyze
   .command('clusters')
   .description('Find repeated patterns (potential components)')
   .option('--json', 'Output as JSON')
-  .action((options) => {
-    checkConnection();
-    let cmd = 'npx figma-use analyze clusters';
-    if (options.json) cmd += ' --json';
-    runFigmaUse(cmd);
+  .action(async (options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const code = `(async () => {
+        const patterns = new Map();
+        function getSignature(node) {
+          if (node.type === 'FRAME' || node.type === 'GROUP') {
+            const childTypes = ('children' in node) ? node.children.map(c => c.type).sort().join(',') : '';
+            return node.type + ':' + childTypes;
+          }
+          return node.type;
+        }
+        function checkNode(node) {
+          if (node.type === 'FRAME' || node.type === 'GROUP') {
+            const sig = getSignature(node);
+            if (!patterns.has(sig)) patterns.set(sig, []);
+            patterns.get(sig).push({ id: node.id, name: node.name });
+          }
+          if ('children' in node) node.children.forEach(c => checkNode(c));
+        }
+        figma.currentPage.children.forEach(c => checkNode(c));
+        return Array.from(patterns.entries())
+          .filter(([_, nodes]) => nodes.length >= 2)
+          .sort((a, b) => b[1].length - a[1].length)
+          .slice(0, 10)
+          .map(([sig, nodes]) => ({ pattern: sig, count: nodes.length, examples: nodes.slice(0, 3) }));
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(chalk.cyan('\nRepeated patterns (potential components):\n'));
+          result.forEach(p => {
+            console.log(`  ${p.count}x: ${p.examples.map(e => e.name).join(', ')}`);
+          });
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Analyze failed: ' + e.message));
+      }
+    } else {
+      let cmd = 'npx figma-use analyze clusters';
+      if (options.json) cmd += ' --json';
+      runFigmaUse(cmd);
+    }
   });
 
 // ============ NODE OPERATIONS (figma-use) ============
@@ -5117,61 +5534,728 @@ node
   .command('tree [nodeId]')
   .description('Show node tree structure')
   .option('-d, --depth <n>', 'Max depth', '3')
-  .action((nodeId, options) => {
-    checkConnection();
-    let cmd = 'npx figma-use node tree';
-    if (nodeId) cmd += ` "${nodeId}"`;
-    cmd += ` --depth ${options.depth}`;
-    runFigmaUse(cmd);
+  .action(async (nodeId, options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const maxDepth = parseInt(options.depth) || 3;
+      const code = `(async () => {
+        const maxDepth = ${maxDepth};
+        const targetId = ${nodeId ? `"${nodeId}"` : 'null'};
+        const root = targetId ? await figma.getNodeByIdAsync(targetId) : figma.currentPage;
+        if (!root) return 'Node not found';
+
+        const lines = [];
+        function printNode(node, indent = 0, depth = 0) {
+          if (depth > maxDepth) return;
+          const prefix = '  '.repeat(indent);
+          const size = node.width && node.height ? \` (\${Math.round(node.width)}x\${Math.round(node.height)})\` : '';
+          lines.push(prefix + node.type + ': ' + node.name + size);
+          if ('children' in node && depth < maxDepth) {
+            node.children.forEach(c => printNode(c, indent + 1, depth + 1));
+          }
+        }
+        printNode(root);
+        return lines.join('\\n');
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        console.log(result);
+      } catch (e) {
+        console.log(chalk.red('✗ Tree failed: ' + e.message));
+      }
+    } else {
+      let cmd = 'npx figma-use node tree';
+      if (nodeId) cmd += ` "${nodeId}"`;
+      cmd += ` --depth ${options.depth}`;
+      runFigmaUse(cmd);
+    }
   });
 
 node
   .command('bindings [nodeId]')
   .description('Show variable bindings for node')
-  .action((nodeId) => {
-    checkConnection();
-    let cmd = 'npx figma-use node bindings';
-    if (nodeId) cmd += ` "${nodeId}"`;
-    runFigmaUse(cmd);
+  .action(async (nodeId) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const code = `(async () => {
+        const targetId = ${nodeId ? `"${nodeId}"` : 'null'};
+        const nodes = targetId
+          ? [await figma.getNodeByIdAsync(targetId)]
+          : figma.currentPage.selection;
+
+        if (!nodes.length) return 'No node selected';
+
+        const results = [];
+        for (const node of nodes) {
+          if (!node) continue;
+          const bindings = {};
+          if (node.boundVariables) {
+            for (const [prop, binding] of Object.entries(node.boundVariables)) {
+              const b = Array.isArray(binding) ? binding[0] : binding;
+              if (b && b.id) {
+                const variable = figma.variables.getVariableById(b.id);
+                bindings[prop] = variable ? variable.name : b.id;
+              }
+            }
+          }
+          results.push({ id: node.id, name: node.name, bindings });
+        }
+        return results;
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        if (typeof result === 'string') {
+          console.log(result);
+        } else {
+          result.forEach(r => {
+            console.log(chalk.cyan(`\n${r.name} (${r.id}):`));
+            if (Object.keys(r.bindings).length === 0) {
+              console.log(chalk.gray('  No variable bindings'));
+            } else {
+              Object.entries(r.bindings).forEach(([prop, varName]) => {
+                console.log(`  ${prop}: ${chalk.green(varName)}`);
+              });
+            }
+          });
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Bindings failed: ' + e.message));
+      }
+    } else {
+      let cmd = 'npx figma-use node bindings';
+      if (nodeId) cmd += ` "${nodeId}"`;
+      runFigmaUse(cmd);
+    }
   });
 
 node
   .command('to-component <nodeIds...>')
   .description('Convert frames to components')
-  .action((nodeIds) => {
-    checkConnection();
-    const cmd = `npx figma-use node to-component "${nodeIds.join(' ')}"`;
-    runFigmaUse(cmd);
+  .action(async (nodeIds) => {
+    await checkConnection();
+
+    // Check if we're in Safe Mode (plugin only, no CDP)
+    let useDaemon = false;
+    try {
+      const healthToken = getDaemonToken();
+      const healthHeader = healthToken ? ` -H "X-Daemon-Token: ${healthToken}"` : '';
+      const healthRes = execSync(`curl -s${healthHeader} http://127.0.0.1:${DAEMON_PORT}/health`, { encoding: 'utf8', timeout: 2000 });
+      const health = JSON.parse(healthRes);
+      useDaemon = health.plugin && !health.cdp;
+    } catch {}
+
+    if (useDaemon) {
+      // Safe Mode: use native Figma API
+      const code = `(async () => {
+        const ids = ${JSON.stringify(nodeIds)};
+        const results = [];
+        for (const id of ids) {
+          const node = await figma.getNodeByIdAsync(id);
+          if (node && (node.type === 'FRAME' || node.type === 'GROUP')) {
+            const comp = figma.createComponentFromNode(node);
+            results.push({ id: comp.id, name: comp.name });
+          }
+        }
+        return results;
+      })()`;
+      try {
+        const result = await fastEval(code);
+        if (result && result.length > 0) {
+          result.forEach(r => console.log(chalk.green(`✓ Converted: ${r.id} (${r.name})`)));
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Convert failed: ' + e.message));
+      }
+    } else {
+      // Yolo Mode: use figma-use
+      const cmd = `npx figma-use node to-component "${nodeIds.join(' ')}"`;
+      runFigmaUse(cmd);
+    }
   });
 
 node
   .command('delete <nodeIds...>')
   .description('Delete nodes by ID')
-  .action((nodeIds) => {
-    checkConnection();
-    const cmd = `npx figma-use node delete "${nodeIds.join(' ')}"`;
-    runFigmaUse(cmd);
+  .action(async (nodeIds) => {
+    await checkConnection();
+
+    // Check if we're in Safe Mode
+    let useDaemon = false;
+    try {
+      const healthToken = getDaemonToken();
+      const healthHeader = healthToken ? ` -H "X-Daemon-Token: ${healthToken}"` : '';
+      const healthRes = execSync(`curl -s${healthHeader} http://127.0.0.1:${DAEMON_PORT}/health`, { encoding: 'utf8', timeout: 2000 });
+      const health = JSON.parse(healthRes);
+      useDaemon = health.plugin && !health.cdp;
+    } catch {}
+
+    if (useDaemon) {
+      // Safe Mode: use native Figma API
+      const code = `(async () => {
+        const ids = ${JSON.stringify(nodeIds)};
+        let deleted = 0;
+        for (const id of ids) {
+          const node = await figma.getNodeByIdAsync(id);
+          if (node) { node.remove(); deleted++; }
+        }
+        return deleted;
+      })()`;
+      try {
+        const result = await fastEval(code);
+        console.log(chalk.green(`✓ Deleted ${result} node(s)`));
+      } catch (e) {
+        console.log(chalk.red('✗ Delete failed: ' + e.message));
+      }
+    } else {
+      // Yolo Mode: use figma-use
+      const cmd = `npx figma-use node delete "${nodeIds.join(' ')}"`;
+      runFigmaUse(cmd);
+    }
   });
 
-// ============ EXPORT (figma-use) ============
+// ============ SLOT COMMANDS ============
+
+const slot = program
+  .command('slot')
+  .description('Slot operations (create, list, preferred, reset, convert)');
+
+slot
+  .command('create <name>')
+  .description('Create a slot on selected component')
+  .option('-f, --flex <direction>', 'Layout direction: row or col', 'col')
+  .option('-g, --gap <value>', 'Gap between items', '0')
+  .option('-p, --padding <value>', 'Padding')
+  .action(async (name, options) => {
+    await checkConnection();
+
+    const flex = options.flex === 'row' ? 'HORIZONTAL' : 'VERTICAL';
+    const gap = parseInt(options.gap) || 0;
+    const padding = options.padding ? parseInt(options.padding) : 0;
+
+    const code = `(async () => {
+      const selection = figma.currentPage.selection;
+      if (selection.length === 0) return { error: 'No component selected' };
+
+      const comp = selection[0];
+      if (comp.type !== 'COMPONENT' && comp.type !== 'COMPONENT_SET') {
+        return { error: 'Selected node is not a component. Select a component first.' };
+      }
+
+      const slot = comp.createSlot(${JSON.stringify(name)});
+      slot.layoutMode = '${flex}';
+      slot.itemSpacing = ${gap};
+      slot.paddingTop = ${padding};
+      slot.paddingBottom = ${padding};
+      slot.paddingLeft = ${padding};
+      slot.paddingRight = ${padding};
+
+      return {
+        success: true,
+        slotId: slot.id,
+        slotName: slot.name,
+        componentName: comp.name
+      };
+    })()`;
+
+    try {
+      const result = await fastEval(code);
+      if (result.error) {
+        console.log(chalk.red('✗ ' + result.error));
+      } else {
+        console.log(chalk.green(`✓ Created slot "${result.slotName}" in component "${result.componentName}"`));
+        console.log(chalk.gray(`  ID: ${result.slotId}`));
+      }
+    } catch (e) {
+      console.log(chalk.red('✗ Failed: ' + e.message));
+    }
+  });
+
+slot
+  .command('list [nodeId]')
+  .description('List slots in a component')
+  .action(async (nodeId) => {
+    await checkConnection();
+
+    const code = `(async () => {
+      const targetId = ${nodeId ? `"${nodeId}"` : 'null'};
+      let comp;
+
+      if (targetId) {
+        comp = await figma.getNodeByIdAsync(targetId);
+      } else {
+        const selection = figma.currentPage.selection;
+        if (selection.length === 0) return { error: 'No component selected' };
+        comp = selection[0];
+      }
+
+      if (comp.type !== 'COMPONENT' && comp.type !== 'COMPONENT_SET') {
+        return { error: 'Node is not a component' };
+      }
+
+      const propDefs = comp.componentPropertyDefinitions;
+      const slots = [];
+
+      for (const [key, def] of Object.entries(propDefs)) {
+        if (def.type === 'SLOT') {
+          slots.push({
+            key,
+            description: def.description,
+            preferredCount: def.preferredValues ? def.preferredValues.length : 0
+          });
+        }
+      }
+
+      // Also find SLOT nodes in children
+      const slotNodes = [];
+      function findSlots(node) {
+        if (node.type === 'SLOT') {
+          slotNodes.push({ id: node.id, name: node.name });
+        }
+        if ('children' in node) {
+          node.children.forEach(findSlots);
+        }
+      }
+      findSlots(comp);
+
+      return {
+        componentName: comp.name,
+        componentId: comp.id,
+        properties: slots,
+        slotNodes
+      };
+    })()`;
+
+    try {
+      const result = await fastEval(code);
+      if (result.error) {
+        console.log(chalk.red('✗ ' + result.error));
+      } else {
+        console.log(chalk.cyan(`\nSlots in "${result.componentName}" (${result.componentId}):`));
+
+        if (result.properties.length === 0) {
+          console.log(chalk.gray('  No slot properties found'));
+        } else {
+          console.log(chalk.white('\nSlot Properties:'));
+          result.properties.forEach(s => {
+            console.log(`  ${chalk.green(s.key)}`);
+            if (s.description) console.log(chalk.gray(`    Description: ${s.description}`));
+            console.log(chalk.gray(`    Preferred values: ${s.preferredCount}`));
+          });
+        }
+
+        if (result.slotNodes.length > 0) {
+          console.log(chalk.white('\nSlot Nodes:'));
+          result.slotNodes.forEach(s => {
+            console.log(`  ${chalk.yellow(s.name)} (${s.id})`);
+          });
+        }
+      }
+    } catch (e) {
+      console.log(chalk.red('✗ Failed: ' + e.message));
+    }
+  });
+
+slot
+  .command('preferred <slotKey> <componentIds...>')
+  .description('Set preferred components for a slot')
+  .option('-n, --node <nodeId>', 'Component ID to modify (otherwise uses selection)')
+  .action(async (slotKey, componentIds, options) => {
+    await checkConnection();
+
+    const code = `(async () => {
+      const targetId = ${options.node ? `"${options.node}"` : 'null'};
+      let comp;
+
+      if (targetId) {
+        comp = await figma.getNodeByIdAsync(targetId);
+      } else {
+        const selection = figma.currentPage.selection;
+        if (selection.length === 0) return { error: 'No component selected' };
+        comp = selection[0];
+      }
+
+      if (comp.type !== 'COMPONENT' && comp.type !== 'COMPONENT_SET') {
+        return { error: 'Node is not a component' };
+      }
+
+      const propDefs = comp.componentPropertyDefinitions;
+
+      // Find the slot property (might need to match partially)
+      let slotPropKey = null;
+      for (const key of Object.keys(propDefs)) {
+        if (key === ${JSON.stringify(slotKey)} || key.startsWith(${JSON.stringify(slotKey)} + '#')) {
+          slotPropKey = key;
+          break;
+        }
+      }
+
+      if (!slotPropKey) {
+        return { error: 'Slot property not found: ' + ${JSON.stringify(slotKey)} };
+      }
+
+      // Get component keys for preferred values
+      const preferredValues = [];
+      const compIds = ${JSON.stringify(componentIds)};
+
+      for (const id of compIds) {
+        const node = await figma.getNodeByIdAsync(id);
+        if (node && (node.type === 'COMPONENT' || node.type === 'COMPONENT_SET')) {
+          preferredValues.push({ type: 'COMPONENT', key: node.key });
+        }
+      }
+
+      if (preferredValues.length === 0) {
+        return { error: 'No valid components found' };
+      }
+
+      comp.editComponentProperty(slotPropKey, { preferredValues });
+
+      return {
+        success: true,
+        slotKey: slotPropKey,
+        preferredCount: preferredValues.length
+      };
+    })()`;
+
+    try {
+      const result = await fastEval(code);
+      if (result.error) {
+        console.log(chalk.red('✗ ' + result.error));
+      } else {
+        console.log(chalk.green(`✓ Set ${result.preferredCount} preferred component(s) for slot "${result.slotKey}"`));
+      }
+    } catch (e) {
+      console.log(chalk.red('✗ Failed: ' + e.message));
+    }
+  });
+
+slot
+  .command('reset [nodeId]')
+  .description('Reset slot in instance to defaults')
+  .action(async (nodeId) => {
+    await checkConnection();
+
+    const code = `(async () => {
+      const targetId = ${nodeId ? `"${nodeId}"` : 'null'};
+      let node;
+
+      if (targetId) {
+        node = await figma.getNodeByIdAsync(targetId);
+      } else {
+        const selection = figma.currentPage.selection;
+        if (selection.length === 0) return { error: 'No slot selected' };
+        node = selection[0];
+      }
+
+      if (node.type !== 'SLOT') {
+        // Try to find slot in instance
+        if (node.type === 'INSTANCE') {
+          const slots = node.children.filter(c => c.type === 'SLOT');
+          if (slots.length === 0) return { error: 'No slots found in instance' };
+          if (slots.length === 1) {
+            node = slots[0];
+          } else {
+            return { error: 'Multiple slots found. Select a specific slot or provide its ID.' };
+          }
+        } else {
+          return { error: 'Node is not a slot. Select a slot node or instance.' };
+        }
+      }
+
+      const beforeCount = node.children.length;
+      node.resetSlot();
+      const afterCount = node.children.length;
+
+      return {
+        success: true,
+        slotName: node.name,
+        beforeCount,
+        afterCount
+      };
+    })()`;
+
+    try {
+      const result = await fastEval(code);
+      if (result.error) {
+        console.log(chalk.red('✗ ' + result.error));
+      } else {
+        console.log(chalk.green(`✓ Reset slot "${result.slotName}"`));
+        console.log(chalk.gray(`  Children: ${result.beforeCount} → ${result.afterCount}`));
+      }
+    } catch (e) {
+      console.log(chalk.red('✗ Failed: ' + e.message));
+    }
+  });
+
+slot
+  .command('convert [nodeId]')
+  .description('Convert a frame to a slot (must be inside a component)')
+  .option('-n, --name <name>', 'Slot name')
+  .action(async (nodeId, options) => {
+    await checkConnection();
+
+    const slotName = options.name || 'Slot';
+
+    const code = `(async () => {
+      const targetId = ${nodeId ? `"${nodeId}"` : 'null'};
+      let frame;
+
+      if (targetId) {
+        frame = await figma.getNodeByIdAsync(targetId);
+      } else {
+        const selection = figma.currentPage.selection;
+        if (selection.length === 0) return { error: 'No frame selected' };
+        frame = selection[0];
+      }
+
+      if (frame.type !== 'FRAME') {
+        return { error: 'Node is not a frame' };
+      }
+
+      // Find parent component
+      let parent = frame.parent;
+      let component = null;
+      while (parent) {
+        if (parent.type === 'COMPONENT' || parent.type === 'COMPONENT_SET') {
+          component = parent;
+          break;
+        }
+        parent = parent.parent;
+      }
+
+      if (!component) {
+        return { error: 'Frame is not inside a component' };
+      }
+
+      // Store frame properties
+      const frameProps = {
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height,
+        layoutMode: frame.layoutMode,
+        itemSpacing: frame.itemSpacing,
+        paddingTop: frame.paddingTop,
+        paddingBottom: frame.paddingBottom,
+        paddingLeft: frame.paddingLeft,
+        paddingRight: frame.paddingRight,
+        fills: frame.fills,
+        children: [...frame.children]
+      };
+
+      // Create slot
+      const slot = component.createSlot(${JSON.stringify(slotName)});
+
+      // Apply frame properties to slot
+      slot.layoutMode = frameProps.layoutMode;
+      slot.itemSpacing = frameProps.itemSpacing;
+      slot.paddingTop = frameProps.paddingTop;
+      slot.paddingBottom = frameProps.paddingBottom;
+      slot.paddingLeft = frameProps.paddingLeft;
+      slot.paddingRight = frameProps.paddingRight;
+      slot.fills = frameProps.fills;
+      slot.resize(frameProps.width, frameProps.height);
+      slot.x = frameProps.x;
+      slot.y = frameProps.y;
+
+      // Move children to slot
+      frameProps.children.forEach(child => {
+        slot.appendChild(child);
+      });
+
+      // Remove original frame
+      frame.remove();
+
+      return {
+        success: true,
+        slotId: slot.id,
+        slotName: slot.name,
+        componentName: component.name
+      };
+    })()`;
+
+    try {
+      const result = await fastEval(code);
+      if (result.error) {
+        console.log(chalk.red('✗ ' + result.error));
+      } else {
+        console.log(chalk.green(`✓ Converted frame to slot "${result.slotName}" in "${result.componentName}"`));
+        console.log(chalk.gray(`  Slot ID: ${result.slotId}`));
+      }
+    } catch (e) {
+      console.log(chalk.red('✗ Failed: ' + e.message));
+    }
+  });
+
+slot
+  .command('add <nodeId>')
+  .description('Add content to a slot in an instance')
+  .option('-c, --component <componentId>', 'Component to instantiate')
+  .option('-f, --frame', 'Add empty frame')
+  .option('-t, --text <content>', 'Add text')
+  .action(async (nodeId, options) => {
+    await checkConnection();
+
+    let addCode = '';
+    if (options.component) {
+      addCode = `
+        const comp = await figma.getNodeByIdAsync(${JSON.stringify(options.component)});
+        if (comp && comp.type === 'COMPONENT') {
+          const inst = comp.createInstance();
+          slot.appendChild(inst);
+          added = { type: 'instance', name: inst.name };
+        } else {
+          return { error: 'Component not found' };
+        }`;
+    } else if (options.frame) {
+      addCode = `
+        const newFrame = figma.createFrame();
+        newFrame.name = 'Content';
+        newFrame.resize(100, 50);
+        slot.appendChild(newFrame);
+        added = { type: 'frame', name: newFrame.name };`;
+    } else if (options.text) {
+      addCode = `
+        await figma.loadFontAsync({family:'Inter',style:'Regular'});
+        const newText = figma.createText();
+        newText.characters = ${JSON.stringify(options.text)};
+        slot.appendChild(newText);
+        added = { type: 'text', content: ${JSON.stringify(options.text)} };`;
+    } else {
+      console.log(chalk.red('✗ Specify --component, --frame, or --text'));
+      return;
+    }
+
+    const code = `(async () => {
+      const slot = await figma.getNodeByIdAsync(${JSON.stringify(nodeId)});
+      if (!slot) return { error: 'Node not found' };
+      if (slot.type !== 'SLOT') return { error: 'Node is not a slot' };
+
+      let added = null;
+      ${addCode}
+
+      return {
+        success: true,
+        slotName: slot.name,
+        added,
+        childCount: slot.children.length
+      };
+    })()`;
+
+    try {
+      const result = await fastEval(code);
+      if (result.error) {
+        console.log(chalk.red('✗ ' + result.error));
+      } else {
+        console.log(chalk.green(`✓ Added ${result.added.type} to slot "${result.slotName}"`));
+        console.log(chalk.gray(`  Children: ${result.childCount}`));
+      }
+    } catch (e) {
+      console.log(chalk.red('✗ Failed: ' + e.message));
+    }
+  });
+
+// ============ EXPORT ============
 
 program
   .command('export-jsx [nodeId]')
   .description('Export node as JSX/React code')
   .option('-o, --output <file>', 'Output file (otherwise stdout)')
   .option('--pretty', 'Format output')
-  .option('--match-icons', 'Match vectors to Iconify icons')
-  .action((nodeId, options) => {
-    checkConnection();
-    let cmd = 'npx figma-use export jsx';
-    if (nodeId) cmd += ` "${nodeId}"`;
-    if (options.pretty) cmd += ' --pretty';
-    if (options.matchIcons) cmd += ' --match-icons';
-    if (options.output) {
-      cmd += ` > "${options.output}"`;
-      runFigmaUse(cmd, { stdio: 'inherit' });
+  .action(async (nodeId, options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const code = `(async () => {
+        const targetId = ${nodeId ? `"${nodeId}"` : 'null'};
+        const nodes = targetId
+          ? [await figma.getNodeByIdAsync(targetId)]
+          : figma.currentPage.selection;
+
+        if (!nodes.length || !nodes[0]) return 'No node selected';
+
+        function rgbToHex(r, g, b) {
+          return '#' + [r, g, b].map(x => Math.round(x * 255).toString(16).padStart(2, '0')).join('');
+        }
+
+        function nodeToJsx(node, indent = 0) {
+          const prefix = '  '.repeat(indent);
+          const props = [];
+
+          // Name
+          if (node.name && !node.name.startsWith('Frame') && !node.name.startsWith('Rectangle')) {
+            props.push('name="' + node.name.replace(/"/g, '\\\\"') + '"');
+          }
+
+          // Size
+          if (node.width) props.push('w={' + Math.round(node.width) + '}');
+          if (node.height) props.push('h={' + Math.round(node.height) + '}');
+
+          // Fill
+          if (node.fills && node.fills.length > 0 && node.fills[0].type === 'SOLID') {
+            const c = node.fills[0].color;
+            props.push('bg="' + rgbToHex(c.r, c.g, c.b) + '"');
+          }
+
+          // Corner radius
+          if (node.cornerRadius && node.cornerRadius > 0) {
+            props.push('rounded={' + Math.round(node.cornerRadius) + '}');
+          }
+
+          // Auto-layout
+          if (node.layoutMode === 'HORIZONTAL') props.push('flex="row"');
+          if (node.layoutMode === 'VERTICAL') props.push('flex="col"');
+          if (node.itemSpacing) props.push('gap={' + Math.round(node.itemSpacing) + '}');
+          if (node.paddingTop) props.push('p={' + Math.round(node.paddingTop) + '}');
+
+          // Text
+          if (node.type === 'TEXT') {
+            const textProps = [];
+            if (node.fontSize) textProps.push('size={' + Math.round(node.fontSize) + '}');
+            if (node.fills && node.fills[0] && node.fills[0].color) {
+              const c = node.fills[0].color;
+              textProps.push('color="' + rgbToHex(c.r, c.g, c.b) + '"');
+            }
+            return prefix + '<Text ' + textProps.join(' ') + '>' + (node.characters || '') + '</Text>';
+          }
+
+          // Frame with children
+          if ('children' in node && node.children.length > 0) {
+            const childJsx = node.children.map(c => nodeToJsx(c, indent + 1)).join('\\n');
+            return prefix + '<Frame ' + props.join(' ') + '>\\n' + childJsx + '\\n' + prefix + '</Frame>';
+          }
+
+          return prefix + '<Frame ' + props.join(' ') + ' />';
+        }
+
+        return nodeToJsx(nodes[0]);
+      })()`;
+
+      try {
+        const result = await fastEval(code);
+        if (options.output) {
+          writeFileSync(options.output, result);
+          console.log(chalk.green(`✓ Exported to ${options.output}`));
+        } else {
+          console.log(result);
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Export failed: ' + e.message));
+      }
     } else {
-      runFigmaUse(cmd);
+      let cmd = 'npx figma-use export jsx';
+      if (nodeId) cmd += ` "${nodeId}"`;
+      if (options.pretty) cmd += ' --pretty';
+      if (options.output) {
+        cmd += ` > "${options.output}"`;
+        runFigmaUse(cmd, { stdio: 'inherit' });
+      } else {
+        runFigmaUse(cmd);
+      }
     }
   });
 
@@ -5179,15 +6263,65 @@ program
   .command('export-storybook [nodeId]')
   .description('Export components as Storybook stories')
   .option('-o, --output <file>', 'Output file (otherwise stdout)')
-  .action((nodeId, options) => {
-    checkConnection();
-    let cmd = 'npx figma-use export storybook';
-    if (nodeId) cmd += ` "${nodeId}"`;
-    if (options.output) {
-      cmd += ` > "${options.output}"`;
-      runFigmaUse(cmd, { stdio: 'inherit' });
+  .action(async (nodeId, options) => {
+    await checkConnection();
+
+    if (await isInSafeMode()) {
+      const code = `(async () => {
+        const components = [];
+        function findComponents(node) {
+          if (node.type === 'COMPONENT' || node.type === 'COMPONENT_SET') {
+            components.push({
+              id: node.id,
+              name: node.name,
+              type: node.type,
+              width: Math.round(node.width),
+              height: Math.round(node.height)
+            });
+          }
+          if ('children' in node) node.children.forEach(c => findComponents(c));
+        }
+        figma.currentPage.children.forEach(c => findComponents(c));
+        return components;
+      })()`;
+
+      try {
+        const components = await fastEval(code);
+        if (!components.length) {
+          console.log(chalk.yellow('No components found on current page'));
+          return;
+        }
+
+        let output = '// Storybook stories generated from Figma\n';
+        output += 'import React from "react";\n\n';
+
+        components.forEach(c => {
+          const safeName = c.name.replace(/[^a-zA-Z0-9]/g, '');
+          output += `export const ${safeName} = () => (\n`;
+          output += `  <div style={{ width: ${c.width}, height: ${c.height} }}>\n`;
+          output += `    {/* ${c.name} - ID: ${c.id} */}\n`;
+          output += `  </div>\n`;
+          output += `);\n\n`;
+        });
+
+        if (options.output) {
+          writeFileSync(options.output, output);
+          console.log(chalk.green(`✓ Exported ${components.length} components to ${options.output}`));
+        } else {
+          console.log(output);
+        }
+      } catch (e) {
+        console.log(chalk.red('✗ Export failed: ' + e.message));
+      }
     } else {
-      runFigmaUse(cmd);
+      let cmd = 'npx figma-use export storybook';
+      if (nodeId) cmd += ` "${nodeId}"`;
+      if (options.output) {
+        cmd += ` > "${options.output}"`;
+        runFigmaUse(cmd, { stdio: 'inherit' });
+      } else {
+        runFigmaUse(cmd);
+      }
     }
   });
 
@@ -5833,6 +6967,433 @@ dsInsertCmd
     } catch (err) {
       spinner.fail(chalk.red(err.message));
       process.exit(1);
+    }
+  });
+
+// ============ SIZES ============
+
+program
+  .command('sizes [nodeId]')
+  .description('Generate Small/Medium/Large size variants from a component')
+  .option('-b, --base <size>', 'Which size is the source: small, medium, large', 'medium')
+  .option('-g, --gap <n>', 'Gap between variants', '40')
+  .action(async (nodeId, options) => {
+    await checkConnection();
+    const spinner = ora('Analyzing component...').start();
+
+    try {
+      const nodeIdStr = nodeId || '';
+      const baseSize = options.base.toLowerCase();
+      const gap = parseInt(options.gap) || 40;
+
+      // Size multipliers relative to medium
+      const sizeConfig = {
+        small:  { scale: 0.85, fontSize: 0.85, padding: 0.75, radius: 0.85 },
+        medium: { scale: 1.0,  fontSize: 1.0,  padding: 1.0,  radius: 1.0 },
+        large:  { scale: 1.2,  fontSize: 1.15, padding: 1.25, radius: 1.1 }
+      };
+
+      // Adjust multipliers based on which size is the source
+      let multipliers = {};
+      const baseConfig = sizeConfig[baseSize];
+      for (const [size, cfg] of Object.entries(sizeConfig)) {
+        multipliers[size] = {
+          scale: cfg.scale / baseConfig.scale,
+          fontSize: cfg.fontSize / baseConfig.fontSize,
+          padding: cfg.padding / baseConfig.padding,
+          radius: cfg.radius / baseConfig.radius
+        };
+      }
+
+      const code = `(async () => {
+        let node;
+        if ('${nodeIdStr}') {
+          node = await figma.getNodeByIdAsync('${nodeIdStr}');
+        } else {
+          node = figma.currentPage.selection[0];
+        }
+
+        if (!node) {
+          return { error: 'No component selected. Select a component or frame.' };
+        }
+
+        // Get the component to clone
+        let sourceComponent = null;
+        if (node.type === 'COMPONENT') {
+          sourceComponent = node;
+        } else if (node.type === 'INSTANCE') {
+          sourceComponent = await node.getMainComponentAsync();
+        } else if (node.type === 'FRAME') {
+          // Convert frame to component first
+          sourceComponent = figma.createComponentFromNode(node.clone());
+          sourceComponent.name = node.name;
+        }
+
+        if (!sourceComponent) {
+          return { error: 'Could not get source component.' };
+        }
+
+        // Load common Inter font styles
+        const styles = ['Regular', 'Medium', 'Semi Bold', 'Bold'];
+        for (const style of styles) {
+          try { await figma.loadFontAsync({ family: 'Inter', style }); } catch (e) {}
+        }
+
+        const multipliers = ${JSON.stringify(multipliers)};
+        const sizes = ['small', 'medium', 'large'];
+        const baseSize = '${baseSize}';
+        const gap = ${gap};
+
+        // Find position for new components
+        let startX = 0;
+        figma.currentPage.children.forEach(n => { startX = Math.max(startX, n.x + n.width); });
+        startX += 200;
+        const startY = sourceComponent.y;
+
+        const baseName = sourceComponent.name.replace(/\\/(Small|Medium|Large)/gi, '').replace(/\\s*(Small|Medium|Large)\\s*/gi, '').trim() || 'Component';
+        const createdComponents = [];
+
+        function scaleNode(node, mult) {
+          // Scale frame/rectangle dimensions
+          if (node.resize && typeof node.width === 'number') {
+            const newW = Math.round(node.width * mult.scale);
+            const newH = Math.round(node.height * mult.scale);
+            node.resize(newW, newH);
+          }
+
+          // Scale corner radius
+          if (typeof node.cornerRadius === 'number' && node.cornerRadius > 0) {
+            node.cornerRadius = Math.round(node.cornerRadius * mult.radius);
+          }
+
+          // Scale padding
+          if (node.paddingLeft !== undefined) {
+            node.paddingLeft = Math.round(node.paddingLeft * mult.padding);
+            node.paddingRight = Math.round(node.paddingRight * mult.padding);
+            node.paddingTop = Math.round(node.paddingTop * mult.padding);
+            node.paddingBottom = Math.round(node.paddingBottom * mult.padding);
+          }
+
+          // Scale gap
+          if (node.itemSpacing !== undefined && node.itemSpacing > 0) {
+            node.itemSpacing = Math.round(node.itemSpacing * mult.padding);
+          }
+
+          // Scale text
+          if (node.type === 'TEXT') {
+            const newSize = Math.round(node.fontSize * mult.fontSize);
+            node.fontSize = newSize;
+          }
+
+          // Recurse into children
+          if (node.children) {
+            for (const child of node.children) {
+              scaleNode(child, mult);
+            }
+          }
+        }
+
+        let x = startX;
+        for (const size of sizes) {
+          const mult = multipliers[size];
+
+          // Clone the source component
+          const clone = sourceComponent.clone();
+
+          // Scale all elements
+          scaleNode(clone, mult);
+
+          // Convert to component with size name
+          const sizeLabel = size.charAt(0).toUpperCase() + size.slice(1);
+
+          let comp;
+          if (clone.type === 'COMPONENT') {
+            comp = clone;
+            comp.name = baseName + '/' + sizeLabel;
+          } else {
+            comp = figma.createComponentFromNode(clone);
+            comp.name = baseName + '/' + sizeLabel;
+          }
+
+          comp.x = x;
+          comp.y = startY;
+          x += comp.width + gap;
+
+          createdComponents.push({ id: comp.id, name: comp.name, w: comp.width, h: comp.height });
+        }
+
+        figma.currentPage.selection = createdComponents.map(c => figma.getNodeById(c.id)).filter(Boolean);
+        figma.viewport.scrollAndZoomIntoView(figma.currentPage.selection);
+
+        return { count: createdComponents.length, components: createdComponents };
+      })()`;
+
+      const result = await fastEval(code);
+
+      if (result.error) {
+        spinner.fail(result.error);
+        return;
+      }
+
+      spinner.succeed(`Created ${result.count} size variants`);
+
+      result.components.forEach(c => {
+        console.log(chalk.gray(`  ${c.name} (${c.w}×${c.h})`));
+      });
+
+    } catch (error) {
+      spinner.fail('Failed: ' + error.message);
+    }
+  });
+
+// ============ COMBOS ============
+
+program
+  .command('combos [nodeId]')
+  .description('Generate all component variant combinations in a labeled grid')
+  .option('-g, --gap <n>', 'Gap between instances', '40')
+  .option('--no-labels', 'Skip row/column labels')
+  .option('--no-boolean', 'Skip boolean properties')
+  .option('--dry-run', 'Show combinations without creating instances')
+  .action(async (nodeId, options) => {
+    await checkConnection();
+    const spinner = ora('Analyzing component properties...').start();
+
+    try {
+      const includeBoolean = options.boolean !== false;
+      const nodeIdStr = nodeId || '';
+
+      const analysisCode = `(async () => {
+        let node;
+        if ('${nodeIdStr}') {
+          node = await figma.getNodeByIdAsync('${nodeIdStr}');
+        } else {
+          node = figma.currentPage.selection[0];
+        }
+
+        if (!node) {
+          return { error: 'No component selected. Select a component set or provide a node ID.' };
+        }
+
+        let componentSet = null;
+        if (node.type === 'COMPONENT_SET') {
+          componentSet = node;
+        } else if (node.type === 'COMPONENT' && node.parent?.type === 'COMPONENT_SET') {
+          componentSet = node.parent;
+        } else if (node.type === 'INSTANCE') {
+          const main = await node.getMainComponentAsync();
+          if (main?.parent?.type === 'COMPONENT_SET') {
+            componentSet = main.parent;
+          }
+        }
+
+        if (!componentSet) {
+          return { error: 'Selected node is not a component set or variant. Select a component with variants.' };
+        }
+
+        const propDefs = componentSet.componentPropertyDefinitions;
+        if (!propDefs || Object.keys(propDefs).length === 0) {
+          return { error: 'Component has no properties defined.' };
+        }
+
+        const properties = [];
+        for (const [name, def] of Object.entries(propDefs)) {
+          if (def.type === 'VARIANT') {
+            properties.push({ name, type: 'VARIANT', options: def.variantOptions || [] });
+          } else if (def.type === 'BOOLEAN' && ${includeBoolean}) {
+            properties.push({ name, type: 'BOOLEAN', options: [true, false] });
+          }
+        }
+
+        if (properties.length === 0) {
+          return { error: 'No variant or boolean properties found.' };
+        }
+
+        const defaultVariant = componentSet.defaultVariant;
+        if (!defaultVariant) {
+          return { error: 'Could not find default variant.' };
+        }
+
+        // Find max size across all variants (for proper grid spacing)
+        let maxW = 0, maxH = 0;
+        for (const child of componentSet.children) {
+          if (child.type === 'COMPONENT') {
+            maxW = Math.max(maxW, child.width);
+            maxH = Math.max(maxH, child.height);
+          }
+        }
+
+        return {
+          componentSetId: componentSet.id,
+          componentSetName: componentSet.name,
+          defaultVariantId: defaultVariant.id,
+          properties,
+          instanceSize: { w: maxW || defaultVariant.width, h: maxH || defaultVariant.height }
+        };
+      })()`;
+
+      const analysis = await fastEval(analysisCode);
+
+      if (analysis.error) {
+        spinner.fail(analysis.error);
+        return;
+      }
+
+      // Calculate cartesian product of all options
+      function cartesian(arrays) {
+        return arrays.reduce((a, b) => a.flatMap(x => b.map(y => [...x, y])), [[]]);
+      }
+
+      const optionArrays = analysis.properties.map(p => p.options);
+      const combinations = cartesian(optionArrays);
+      const totalCombos = combinations.length;
+
+      spinner.text = `Found ${totalCombos} combinations for ${analysis.properties.length} properties`;
+
+      if (options.dryRun) {
+        spinner.succeed(`${totalCombos} combinations (dry run)`);
+        console.log(chalk.cyan('\nProperties:'));
+        analysis.properties.forEach(p => {
+          console.log(`  ${p.name}: ${p.options.join(', ')}`);
+        });
+        console.log(chalk.cyan(`\nWould create ${totalCombos} instances`));
+        return;
+      }
+
+      // Determine grid layout
+      const gap = parseInt(options.gap) || 40;
+      const labelHeight = options.labels !== false ? 30 : 0;
+      const labelWidth = options.labels !== false ? 120 : 0;
+      const colProp = analysis.properties[analysis.properties.length - 1];
+      const rowProps = analysis.properties.slice(0, -1);
+      const numCols = colProp.options.length;
+      const numRows = rowProps.length > 0 ? rowProps.reduce((acc, p) => acc * p.options.length, 1) : 1;
+      const instanceW = analysis.instanceSize.w;
+      const instanceH = analysis.instanceSize.h;
+      const showLabels = options.labels !== false;
+
+      spinner.text = `Creating ${totalCombos} components in ${numRows}x${numCols} grid...`;
+
+      const createCode = `(async () => {
+        const componentSet = await figma.getNodeByIdAsync('${analysis.componentSetId}');
+        const defaultVariant = await figma.getNodeByIdAsync('${analysis.defaultVariantId}');
+
+        await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
+        await figma.loadFontAsync({ family: 'Inter', style: 'Medium' });
+
+        let startX = 0;
+        figma.currentPage.children.forEach(n => { startX = Math.max(startX, n.x + n.width); });
+        startX += 200;
+        const startY = 100;
+
+        const gap = ${gap};
+        const instanceW = ${instanceW};
+        const instanceH = ${instanceH};
+        const baseName = '${analysis.componentSetName.replace(/'/g, "\\'")}';
+        const showLabels = ${showLabels};
+        const labelOffset = showLabels ? 120 : 0;
+        const headerOffset = showLabels ? 40 : 0;
+
+        const properties = ${JSON.stringify(analysis.properties)};
+        const combinations = ${JSON.stringify(combinations)};
+        const colProp = properties[properties.length - 1];
+        const rowProps = properties.slice(0, -1);
+
+        const createdComponents = [];
+        const createdLabels = [];
+        const rowCombos = new Map();
+        for (const combo of combinations) {
+          const rowKey = combo.slice(0, -1).join('|');
+          if (!rowCombos.has(rowKey)) rowCombos.set(rowKey, []);
+          rowCombos.get(rowKey).push(combo);
+        }
+
+        // Create column headers (last property values)
+        if (showLabels) {
+          for (let colIndex = 0; colIndex < colProp.options.length; colIndex++) {
+            const label = figma.createText();
+            label.fontName = { family: 'Inter', style: 'Medium' };
+            label.characters = String(colProp.options[colIndex]);
+            label.fontSize = 14;
+            label.fills = [{ type: 'SOLID', color: { r: 0.6, g: 0.6, b: 0.6 } }];
+            label.x = startX + labelOffset + colIndex * (instanceW + gap) + instanceW / 2 - label.width / 2;
+            label.y = startY;
+            createdLabels.push(label);
+          }
+        }
+
+        let rowIndex = 0;
+        for (const [rowKey, combos] of rowCombos) {
+          // Create row label (all properties except last)
+          if (showLabels && rowProps.length > 0) {
+            const rowValues = rowKey.split('|');
+            const label = figma.createText();
+            label.fontName = { family: 'Inter', style: 'Regular' };
+            label.characters = rowValues.join(' / ');
+            label.fontSize = 12;
+            label.fills = [{ type: 'SOLID', color: { r: 0.5, g: 0.5, b: 0.5 } }];
+            label.x = startX;
+            label.y = startY + headerOffset + rowIndex * (instanceH + gap) + instanceH / 2 - label.height / 2;
+            createdLabels.push(label);
+          }
+
+          for (let colIndex = 0; colIndex < combos.length; colIndex++) {
+            const combo = combos[colIndex];
+
+            // Create instance and set properties
+            const instance = defaultVariant.createInstance();
+            const propsToSet = {};
+            for (let i = 0; i < properties.length; i++) {
+              propsToSet[properties[i].name] = combo[i];
+            }
+            try {
+              instance.setProperties(propsToSet);
+            } catch (e) {
+              instance.remove();
+              continue;
+            }
+
+            // Detach from component to get a frame
+            const detached = instance.detachInstance();
+
+            // Convert to component with proper name
+            const compName = baseName + '/' + combo.join('/');
+            const component = figma.createComponentFromNode(detached);
+            component.name = compName;
+
+            // Position on canvas (offset for labels)
+            component.x = startX + labelOffset + colIndex * (instanceW + gap);
+            component.y = startY + headerOffset + rowIndex * (instanceH + gap);
+
+            createdComponents.push({ id: component.id, name: component.name });
+          }
+          rowIndex++;
+        }
+
+        const allNodes = [...createdComponents.map(c => figma.getNodeById(c.id)), ...createdLabels].filter(Boolean);
+        figma.currentPage.selection = allNodes;
+        if (allNodes.length > 0) {
+          figma.viewport.scrollAndZoomIntoView(allNodes);
+        }
+
+        return { count: createdComponents.length, labels: createdLabels.length, gridSize: rowIndex + 'x' + colProp.options.length, components: createdComponents.slice(0, 3) };
+      })()`;
+
+      const result = await fastEval(createCode);
+
+      if (result.error) {
+        spinner.fail(result.error);
+        return;
+      }
+
+      const labelInfo = result.labels > 0 ? ` with ${result.labels} labels` : '';
+      spinner.succeed(`Created ${result.count} components in ${result.gridSize} grid${labelInfo}`);
+      if (result.components && result.components.length > 0) {
+        console.log(chalk.gray(`  ${result.components.map(c => c.name).join(', ')}${result.count > 3 ? ', ...' : ''}`));
+      }
+
+    } catch (error) {
+      spinner.fail('Failed: ' + error.message);
     }
   });
 

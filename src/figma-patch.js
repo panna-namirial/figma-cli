@@ -5,8 +5,9 @@
  * Newer Figma versions block --remote-debugging-port by default.
  */
 
-import { readFileSync, writeFileSync, accessSync, constants } from 'fs';
+import { readFileSync, writeFileSync, accessSync, constants, readdirSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
+import { join } from 'path';
 
 // Fixed CDP port (figma-use has 9222 hardcoded)
 const CDP_PORT = 9222;
@@ -18,10 +19,84 @@ export function getCdpPort() {
   return CDP_PORT;
 }
 
+/**
+ * Find Windows Figma app folder (handles versioned folders like app-124.0.0)
+ */
+function findWindowsFigmaPath() {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) return null;
+
+  const figmaBase = join(localAppData, 'Figma');
+  if (!existsSync(figmaBase)) return null;
+
+  try {
+    const entries = readdirSync(figmaBase);
+
+    // Look for versioned app folders (app-124.0.0, app-125.1.0, etc.)
+    const appFolders = entries
+      .filter(e => e.startsWith('app-'))
+      .sort()
+      .reverse(); // Latest version first
+
+    for (const folder of appFolders) {
+      const asarPath = join(figmaBase, folder, 'resources', 'app.asar');
+      if (existsSync(asarPath)) {
+        return asarPath;
+      }
+    }
+
+    // Fallback: check old path without version folder
+    const oldPath = join(figmaBase, 'resources', 'app.asar');
+    if (existsSync(oldPath)) {
+      return oldPath;
+    }
+  } catch {
+    // Ignore errors
+  }
+
+  return null;
+}
+
+/**
+ * Find Windows Figma executable
+ */
+function findWindowsFigmaExe() {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) return null;
+
+  const figmaBase = join(localAppData, 'Figma');
+
+  // Check main Figma.exe first
+  const mainExe = join(figmaBase, 'Figma.exe');
+  if (existsSync(mainExe)) {
+    return mainExe;
+  }
+
+  // Check versioned folders
+  try {
+    const entries = readdirSync(figmaBase);
+    const appFolders = entries
+      .filter(e => e.startsWith('app-'))
+      .sort()
+      .reverse();
+
+    for (const folder of appFolders) {
+      const exePath = join(figmaBase, folder, 'Figma.exe');
+      if (existsSync(exePath)) {
+        return exePath;
+      }
+    }
+  } catch {
+    // Ignore errors
+  }
+
+  return null;
+}
+
 // Figma app.asar locations by platform
 const ASAR_PATHS = {
   darwin: '/Applications/Figma.app/Contents/Resources/app.asar',
-  win32: `${process.env.LOCALAPPDATA}\\Figma\\resources\\app.asar`,
+  win32: null, // Detected dynamically
   linux: '/opt/figma/resources/app.asar'
 };
 
@@ -34,6 +109,9 @@ const PATCH_STRING = Buffer.from('removeSwitch("remote-debugXing-port")');
  * Get the path to Figma's app.asar file
  */
 export function getAsarPath() {
+  if (process.platform === 'win32') {
+    return findWindowsFigmaPath();
+  }
   return ASAR_PATHS[process.platform] || null;
 }
 
@@ -168,8 +246,13 @@ export function getFigmaCommand(port = 9222) {
   switch (process.platform) {
     case 'darwin':
       return `open -a Figma --args --remote-debugging-port=${port}`;
-    case 'win32':
+    case 'win32': {
+      const exePath = findWindowsFigmaExe();
+      if (exePath) {
+        return `"${exePath}" --remote-debugging-port=${port}`;
+      }
       return `"%LOCALAPPDATA%\\Figma\\Figma.exe" --remote-debugging-port=${port}`;
+    }
     case 'linux':
       return `figma --remote-debugging-port=${port}`;
     default:
@@ -185,7 +268,7 @@ export function getFigmaBinaryPath() {
     case 'darwin':
       return '/Applications/Figma.app/Contents/MacOS/Figma';
     case 'win32':
-      return `${process.env.LOCALAPPDATA}\\Figma\\Figma.exe`;
+      return findWindowsFigmaExe() || `${process.env.LOCALAPPDATA}\\Figma\\Figma.exe`;
     case 'linux':
       return '/usr/bin/figma';
     default:

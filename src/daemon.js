@@ -174,8 +174,8 @@ async function evalViaPlugin(code) {
     const id = ++pluginMsgId;
     const timeout = setTimeout(() => {
       pluginPendingRequests.delete(id);
-      reject(new Error('Plugin execution timeout'));
-    }, 30000);
+      reject(new Error('Plugin execution timeout (90s)'));
+    }, 90000); // 90s timeout
 
     pluginPendingRequests.set(id, { resolve, reject, timeout });
 
@@ -189,21 +189,51 @@ async function evalViaPlugin(code) {
 
 // ============ UNIFIED EVAL ============
 
+/**
+ * Wrap code to handle top-level return statements
+ * CDP's Runtime.evaluate doesn't support bare return, so wrap in IIFE if needed
+ */
+function wrapCodeIfNeeded(code) {
+  const trimmed = code.trim();
+
+  // Already wrapped in IIFE or async IIFE
+  if (trimmed.startsWith('(async') || trimmed.startsWith('(function') || trimmed.startsWith('(() =>')) {
+    return code;
+  }
+
+  // Check if code has top-level return (not inside a function)
+  // Simple heuristic: if 'return' appears before the first '{' or at start
+  const hasTopLevelReturn = /^\s*return\b/.test(trimmed) ||
+    /;\s*return\b/.test(trimmed) ||
+    /^\s*const\s+\w+\s*=.*;\s*return\b/m.test(trimmed);
+
+  if (hasTopLevelReturn) {
+    // Wrap in async IIFE to support both sync and async code
+    return `(async () => { ${code} })()`;
+  }
+
+  return code;
+}
+
 async function executeEval(code) {
   // Auto mode: prefer plugin if connected, fallback to CDP
   if (MODE === 'auto') {
     if (isPluginConnected()) {
+      // Plugin handles its own wrapping, send code as-is
       return evalViaPlugin(code);
     }
-    return evalViaCdp(code);
+    // CDP needs wrapping for top-level return statements
+    return evalViaCdp(wrapCodeIfNeeded(code));
   }
 
   // Explicit mode
   if (MODE === 'plugin') {
+    // Plugin handles its own wrapping
     return evalViaPlugin(code);
   }
 
-  return evalViaCdp(code);
+  // CDP mode
+  return evalViaCdp(wrapCodeIfNeeded(code));
 }
 
 function getMode() {
@@ -289,7 +319,7 @@ async function handleRequest(req, res) {
             return Promise.race([
               fn(),
               new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Execution timeout')), 60000)
+                setTimeout(() => reject(new Error('Execution timeout (90s)')), 90000)
               )
             ]);
           };

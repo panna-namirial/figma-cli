@@ -17,6 +17,19 @@ CLI that controls Figma Desktop directly. No API key needed.
 | "find nodes named X" | `node src/index.js find "X"` |
 | "what's on canvas" | `node src/index.js canvas info` |
 | "export as PNG/SVG" | `node src/index.js export png` |
+| "show all variants" | `node src/index.js combos` |
+| "create size variants" | `node src/index.js sizes --base small` |
+| "create a slot" | `node src/index.js slot create "Name"` |
+| "list slots" | `node src/index.js slot list` |
+| "reset slot" | `node src/index.js slot reset` |
+| "find component named X" | `node src/index.js find "X"` |
+| "list all components" | eval `figma.currentPage.findAll(n => n.type === 'COMPONENT_SET')` |
+| "inspect component properties" | eval `figma.getNodeById('ID').componentPropertyDefinitions` |
+| "create instance of component" | eval `figma.getNodeById('ID').defaultVariant.createInstance()` |
+| "set variant/property on instance" | eval `instance.setProperties({ 'Size': 'Large' })` |
+| "list project variables" | `node src/index.js var list` |
+| "test accessibility" | `node src/index.js lint` |
+| "compose a page with components" | eval pattern (see Composing Pages section) |
 
 **Full command reference:** See REFERENCE.md
 
@@ -99,6 +112,12 @@ Uses plugin, no Figma modification. Start plugin each session.
 node src/index.js connect --safe
 ```
 Then: Plugins → Development → FigCli
+
+**Safe Mode Notes:**
+- All commands work via daemon (no figma-use dependency)
+- 60s timeout (same as Yolo Mode)
+- For complex screens, use smaller batches or `eval` with native API
+- `render-batch` automatically uses daemon-based rendering
 
 ---
 
@@ -192,6 +211,94 @@ node src/index.js render '<Frame name="Landing Page" w={1440} flex="col" bg="#0a
   </Frame>
 </Frame>'
 ```
+
+---
+
+## Slots
+
+Figma's native slots feature allows flexible content areas in components. Slots let designers add, remove, and reorder content in instances without detaching.
+
+### Slot Commands
+
+```bash
+# Create slot on selected component
+node src/index.js slot create "Content" --flex col --gap 8 --padding 16
+
+# List slots in component
+node src/index.js slot list
+node src/index.js slot list "component-id"
+
+# Set preferred components for a slot
+node src/index.js slot preferred "Slot#1:2" "component-id-1" "component-id-2"
+
+# Reset slot in instance to defaults
+node src/index.js slot reset
+node src/index.js slot reset "slot-node-id"
+
+# Convert frame to slot (must be inside component)
+node src/index.js slot convert --name "Actions"
+
+# Add content to slot in instance
+node src/index.js slot add "slot-id" --component "component-id"
+node src/index.js slot add "slot-id" --frame
+node src/index.js slot add "slot-id" --text "Hello"
+```
+
+### JSX Slot Syntax
+
+Use `<Slot>` in JSX to create slots. When parent is a component, creates real SLOT. Otherwise falls back to frame.
+
+```jsx
+<Frame name="Card" w={300} h={200} bg="#18181b" rounded={12} flex="col" p={16} gap={12}>
+  <Text size={18} weight="bold" color="#fff">Card Title</Text>
+  <Slot name="Content" flex="col" gap={8} w="fill">
+    <Text size={14} color="#a1a1aa">Default slot content</Text>
+  </Slot>
+</Frame>
+```
+
+**Slot props:**
+- `name` - Slot name (shown in properties panel)
+- `flex` - Layout direction: "row" or "col"
+- `gap` - Spacing between items
+- `p`, `px`, `py` - Padding
+- `w`, `h` - Size ("fill" or fixed)
+- `bg` - Background fill
+
+**Self-closing slot (empty):**
+```jsx
+<Slot name="Actions" flex="row" gap={8} />
+```
+
+### Slot Workflow
+
+1. **Create component with slot:**
+```bash
+# Render component structure
+node src/index.js render '<Frame name="Card" ...>
+  <Slot name="Content" flex="col" w="fill" />
+</Frame>'
+
+# Convert to component
+node src/index.js node to-component "frame-id"
+```
+
+2. **Or add slot to existing component:**
+```bash
+# Select component, then:
+node src/index.js slot create "Content" --flex col --gap 8
+```
+
+3. **Set preferred components:**
+```bash
+node src/index.js slot preferred "Slot#1:2" "button-comp-id" "icon-comp-id"
+```
+
+4. **In instances, slots allow:**
+- Adding any content (or only preferred if set)
+- Reordering children
+- Removing children
+- Reset to defaults with `slot reset`
 
 ---
 
@@ -429,7 +536,7 @@ node src/index.js render '<Frame name="Card" w={320} h={200} bg="#18181b" rounde
 </Frame>
 ```
 
-**3. Buttons need flex for centered text:**
+**3. Buttons need flex + fixed width for centered text:**
 ```jsx
 // BAD: No flex, text not centered
 <Frame bg="#3b82f6" px={16} py={10} rounded={10}>
@@ -440,6 +547,29 @@ node src/index.js render '<Frame name="Card" w={320} h={200} bg="#18181b" rounde
 <Frame bg="#3b82f6" px={16} py={10} rounded={10} flex="row" justify="center" items="center">
   <Text>Button</Text>
 </Frame>
+
+// BEST (for components): Fixed width + auto-layout + text fills
+<Frame w={100} h={40} bg="#3b82f6" rounded={8} flex="row" justify="center" items="center" px={16} py={10}>
+  <Text color="#fff" w="fill" align="center">Button</Text>
+</Frame>
+```
+
+**Button component pattern (for variants):**
+```javascript
+// When creating button components programmatically:
+frame.layoutMode = "HORIZONTAL";
+frame.primaryAxisSizingMode = "FIXED";    // Keep fixed width
+frame.counterAxisSizingMode = "FIXED";    // Keep fixed height
+frame.resize(100, 40);                     // Set size AFTER layout mode
+frame.primaryAxisAlignItems = "CENTER";
+frame.counterAxisAlignItems = "CENTER";
+frame.paddingLeft = frame.paddingRight = 16;
+frame.paddingTop = frame.paddingBottom = 10;
+
+// Text inside button
+text.textAlignHorizontal = "CENTER";
+text.layoutAlign = "STRETCH";              // Fill available width
+text.layoutGrow = 1;                       // Grow to fill
 ```
 
 **4. No emojis - use shapes as icons:**
@@ -525,4 +655,395 @@ node src/index.js screenshot-url "https://example.com"
 ```bash
 node src/index.js daemon status
 node src/index.js daemon restart
+```
+
+---
+
+## Working with Existing Components
+
+When user asks to "use existing Button/Card", "create instances", "compose a screen with components".
+
+**Always follow this 4-step workflow:**
+
+### Step 1: Find the Component
+
+```bash
+node src/index.js find "Button"               # Partial name match
+node src/index.js find "Card" -t COMPONENT_SET  # Filter type
+```
+
+Output example:
+```
+1:23 [COMPONENT_SET] Button
+1:24 [COMPONENT] Button/Primary/Default
+1:25 [COMPONENT] Button/Secondary/Large
+```
+
+Use the **COMPONENT_SET** id for variant access, or a specific **COMPONENT** id if you want a fixed variant.
+
+### Step 2: Inspect Component Properties
+
+```bash
+node src/index.js eval "
+const comp = figma.getNodeById('1:23');
+const defs = comp.componentPropertyDefinitions;
+return JSON.stringify(Object.entries(defs).map(([name, def]) => ({
+  name,
+  type: def.type,
+  options: def.variantOptions || (def.type === 'BOOLEAN' ? [true, false] : ['(text)']),
+  default: def.defaultValue
+})), null, 2);
+"
+```
+
+This returns: property names, types (`VARIANT`, `BOOLEAN`, `TEXT`), and available options.
+
+### Step 3: Create Instance with Properties
+
+```bash
+node src/index.js eval "
+const compSet = figma.getNodeById('1:23');
+const instance = compSet.defaultVariant.createInstance();
+
+// Set VARIANT, BOOLEAN, TEXT properties
+instance.setProperties({
+  'Size': 'Large',       // VARIANT
+  'State': 'Default',    // VARIANT
+  'hasIcon': false,      // BOOLEAN
+  'Label': 'Click me'    // TEXT (if supported as property)
+});
+
+instance.x = 100;
+instance.y = 100;
+figma.currentPage.appendChild(instance);
+return { id: instance.id, name: instance.name };
+"
+```
+
+### Step 4: Set Text Content Inside Instance
+
+If the component has internal text nodes (not TEXT properties), edit them directly:
+
+```bash
+node src/index.js eval "
+const instance = figma.getNodeById('INSTANCE_ID');
+
+// Find text node by name
+const textNode = instance.findOne(n => n.type === 'TEXT' && n.name === 'Label');
+if (textNode) {
+  await figma.loadFontAsync(textNode.fontName);
+  textNode.characters = 'New text content';
+}
+
+// Or iterate all text nodes
+const allText = instance.findAll(n => n.type === 'TEXT');
+return JSON.stringify(allText.map(t => ({ id: t.id, name: t.name, text: t.characters })));
+"
+```
+
+**CRITICAL: Always call `figma.loadFontAsync(textNode.fontName)` before changing `characters`.**
+
+### List All Components in File
+
+```bash
+node src/index.js eval "
+const comps = figma.currentPage.findAll(n =>
+  n.type === 'COMPONENT' || n.type === 'COMPONENT_SET'
+);
+return JSON.stringify(comps.map(c => ({
+  id: c.id,
+  name: c.name,
+  type: c.type,
+  w: Math.round(c.width),
+  h: Math.round(c.height)
+})), null, 2);
+"
+```
+
+---
+
+## Project Variables (Existing)
+
+When user says "use existing variables", "bind our design tokens", "apply brand colors".
+
+**ALWAYS discover variables first before using `var:` syntax or `bind` commands.**
+
+### Step 1: List Existing Variables
+
+```bash
+node src/index.js var list              # All variables (names + types)
+node src/index.js bind list             # All bindable variables
+node src/index.js bind list -t COLOR    # Color variables only
+```
+
+### Step 2: Find by Name Pattern
+
+```bash
+node src/index.js var find "primary"    # Search by pattern
+node src/index.js var find "semantic"   # Find semantic tokens
+node src/index.js var find "color/"     # Find by path prefix
+```
+
+### Step 3: Use Exact Variable Name in var: Syntax
+
+After discovering the real name from `var list`, use it directly:
+
+```bash
+# Use exact name from var list output (e.g. "semantic/background", "colors/blue-500")
+node src/index.js render '<Frame bg="var:semantic/background" stroke="var:semantic/border">
+  <Text color="var:semantic/foreground">Text</Text>
+</Frame>'
+```
+
+**`var:name` works with ANY local variable, not just shadcn presets. Use the exact name from `var list`.**
+
+### Step 4: Bind Variable to Existing Node
+
+```bash
+node src/index.js bind fill "semantic/background" -n "NODE_ID"
+node src/index.js bind stroke "semantic/border" -n "NODE_ID"
+node src/index.js bind radius "spacing/sm" -n "NODE_ID"
+node src/index.js bind gap "spacing/md" -n "NODE_ID"
+```
+
+### Switch Variable Mode (Light/Dark)
+
+```bash
+node src/index.js eval "
+const node = figma.getNodeById('FRAME_ID');
+
+// Discover modes from bound variables
+function findModeCollection(n) {
+  if (n.boundVariables) {
+    for (const [, binding] of Object.entries(n.boundVariables)) {
+      const b = Array.isArray(binding) ? binding[0] : binding;
+      if (b?.id) {
+        const variable = figma.variables.getVariableById(b.id);
+        if (variable) {
+          const col = figma.variables.getVariableCollectionById(variable.variableCollectionId);
+          if (col?.modes?.length > 1) return { col, modes: col.modes };
+        }
+      }
+    }
+  }
+  if (n.children) for (const c of n.children) {
+    const found = findModeCollection(c);
+    if (found) return found;
+  }
+  return null;
+}
+
+const found = findModeCollection(node);
+if (found) {
+  // found.modes = [{ modeId, name }]  e.g. 'Light', 'Dark'
+  const mode = found.modes.find(m => m.name.toLowerCase().includes('dark'));
+  if (mode) node.setExplicitVariableModeForCollection(found.col, mode.modeId);
+}
+return found ? found.modes.map(m => m.name) : 'no modes found';
+"
+```
+
+---
+
+## Composing Pages with Existing Components
+
+When user asks to "compose a home page", "design a screen using our components", "create a layout with Navbar + Hero + Footer".
+
+**Strategy: Use a single `eval` with `createInstance()` calls.**
+This is more reliable than `render` for complex layouts with existing components.
+
+### Discovery First (Always Run Before Composing)
+
+```bash
+# 1. See all available components
+node src/index.js eval "
+const comps = figma.currentPage.findAll(n => n.type === 'COMPONENT_SET');
+return JSON.stringify(comps.map(c => ({ id: c.id, name: c.name })));
+"
+
+# 2. See what's already on canvas
+node src/index.js canvas info
+```
+
+### Page Composition Pattern
+
+```bash
+node src/index.js eval "
+// 1. Create page frame with vertical auto-layout
+const page = figma.createFrame();
+page.name = 'Home Page';
+page.resize(1440, 900);
+page.layoutMode = 'VERTICAL';
+page.primaryAxisSizingMode = 'FIXED';
+page.counterAxisSizingMode = 'FIXED';
+page.itemSpacing = 0;
+page.fills = [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }];
+
+// 2. Add Navbar instance
+const navbarSet = figma.getNodeById('NAVBAR_COMPONENT_SET_ID');
+const navbar = navbarSet.defaultVariant.createInstance();
+navbar.layoutAlign = 'STRETCH';  // Fill page width
+navbar.primaryAxisSizingMode = 'AUTO';
+page.appendChild(navbar);
+
+// 3. Add Hero instance with custom properties
+const heroSet = figma.getNodeById('HERO_COMPONENT_SET_ID');
+const hero = heroSet.defaultVariant.createInstance();
+hero.layoutAlign = 'STRETCH';
+hero.setProperties({ 'Variant': 'Dark', 'hasImage': true });
+page.appendChild(hero);
+
+// 4. Add Cards section (manual frame with instances inside)
+const cardsRow = figma.createFrame();
+cardsRow.layoutMode = 'HORIZONTAL';
+cardsRow.itemSpacing = 24;
+cardsRow.paddingLeft = cardsRow.paddingRight = 80;
+cardsRow.paddingTop = cardsRow.paddingBottom = 64;
+cardsRow.layoutAlign = 'STRETCH';
+cardsRow.primaryAxisSizingMode = 'AUTO';
+cardsRow.counterAxisSizingMode = 'AUTO';
+cardsRow.fills = [];
+
+const cardSet = figma.getNodeById('CARD_COMPONENT_SET_ID');
+const cardTitles = ['Feature One', 'Feature Two', 'Feature Three'];
+for (const title of cardTitles) {
+  const card = cardSet.defaultVariant.createInstance();
+  // Set text content
+  const titleNode = card.findOne(n => n.type === 'TEXT' && n.name === 'Title');
+  if (titleNode) {
+    await figma.loadFontAsync(titleNode.fontName);
+    titleNode.characters = title;
+  }
+  cardsRow.appendChild(card);
+}
+page.appendChild(cardsRow);
+
+// 5. Position on canvas
+page.x = 0;
+page.y = 0;
+figma.currentPage.appendChild(page);
+figma.viewport.scrollAndZoomIntoView([page]);
+return { id: page.id, name: page.name };
+"
+```
+
+### Multiple Different Pages in a File
+
+```bash
+node src/index.js eval "
+// Create named frames for each screen
+const screens = [
+  { name: 'Home', componentId: 'HOME_ID' },
+  { name: 'About', componentId: 'ABOUT_ID' },
+  { name: 'Contact', componentId: 'CONTACT_ID' }
+];
+
+let x = 0;
+for (const screen of screens) {
+  const comp = figma.getNodeById(screen.componentId);
+  if (!comp) continue;
+  const frame = comp.defaultVariant.createInstance();
+  frame.name = screen.name;
+  frame.x = x;
+  frame.y = 0;
+  figma.currentPage.appendChild(frame);
+  x += frame.width + 100;
+}
+figma.viewport.scrollAndZoomIntoView(figma.currentPage.children);
+"
+```
+
+---
+
+## Accessibility Testing
+
+When user asks for "accessibility test", "check WCAG", "test contrast", "a11y audit".
+
+### Basic Lint (Covers Most A11y Checks)
+
+```bash
+node src/index.js lint              # Lint entire canvas
+node src/index.js lint "NODE_ID"    # Lint specific frame
+```
+
+**Checks performed automatically:**
+- Color contrast (WCAG AA ≥4.5:1 for normal text, ≥3:1 for large text)
+- Text size (warning if < 12px)
+- Missing component descriptions (alt text equivalent)
+- Hardcoded colors not bound to variables
+- Deep nesting (>10 levels)
+- Empty frames
+
+### Contrast Check for Specific Element
+
+```bash
+node src/index.js eval "
+function luminance(r, g, b) {
+  return [r, g, b].reduce((acc, c, i) => {
+    c = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    return acc + c * [0.2126, 0.7152, 0.0722][i];
+  }, 0);
+}
+
+function contrast(c1, c2) {
+  const L1 = luminance(c1.r, c1.g, c1.b);
+  const L2 = luminance(c2.r, c2.g, c2.b);
+  return (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+}
+
+// Find all text nodes and check their contrast
+const texts = figma.currentPage.findAll(n => n.type === 'TEXT');
+const results = [];
+for (const text of texts) {
+  const fill = text.fills[0];
+  if (!fill || fill.type !== 'SOLID') continue;
+  // Find parent background
+  let parent = text.parent;
+  while (parent && parent.type !== 'PAGE') {
+    const bg = parent.fills?.[0];
+    if (bg?.type === 'SOLID') {
+      const ratio = contrast(fill.color, bg.color);
+      results.push({
+        node: text.name || text.characters?.slice(0, 20),
+        ratio: ratio.toFixed(2),
+        AA: ratio >= 4.5 ? 'PASS' : 'FAIL',
+        AALarge: ratio >= 3 ? 'PASS' : 'FAIL'
+      });
+      break;
+    }
+    parent = parent.parent;
+  }
+}
+return JSON.stringify(results, null, 2);
+"
+```
+
+### Full Accessibility Report
+
+```bash
+node src/index.js eval "
+const issues = [];
+
+// 1. Text too small
+figma.currentPage.findAll(n => n.type === 'TEXT').forEach(t => {
+  if (t.fontSize < 12) issues.push({ type: 'error', id: t.id, msg: 'Text too small: ' + t.fontSize + 'px' });
+  if (t.fontSize < 16 && t.fontSize >= 12) issues.push({ type: 'warning', id: t.id, msg: 'Text small: ' + t.fontSize + 'px' });
+});
+
+// 2. Interactive elements without descriptions
+figma.currentPage.findAll(n => n.type === 'INSTANCE').forEach(inst => {
+  if (!inst.description && (inst.name.toLowerCase().includes('button') || inst.name.toLowerCase().includes('link'))) {
+    issues.push({ type: 'warning', id: inst.id, msg: 'Interactive element missing description: ' + inst.name });
+  }
+});
+
+// 3. Empty frames
+figma.currentPage.findAll(n => n.type === 'FRAME' && n.children.length === 0).forEach(f => {
+  issues.push({ type: 'info', id: f.id, msg: 'Empty frame: ' + f.name });
+});
+
+const counts = { error: 0, warning: 0, info: 0 };
+issues.forEach(i => counts[i.type]++);
+return JSON.stringify({ summary: counts, issues }, null, 2);
+"
 ```

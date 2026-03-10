@@ -28,6 +28,7 @@ A CLI that connects directly to Figma Desktop and gives you complete control:
 
 - **Design Tokens** — Create variables, collections, modes (Light/Dark), bind to nodes
 - **Create Anything** — Frames, text, shapes, icons (150k+ from Iconify), components
+- **Slots** — Create and manage Figma's new Slots feature for flexible component content
 - **Team Libraries** — Import and use components, styles, variables from any library
 - **Analyze Designs** — Colors, typography, spacing, find repeated patterns
 - **Lint & Accessibility** — Contrast checker, touch targets, design rules
@@ -165,9 +166,11 @@ node src/index.js connect
 - No patching, no app modification
 - Works everywhere (corporate, personal, any environment)
 - No Full Disk Access needed
+- **Full feature parity** with Yolo Mode (all commands work)
 
 **Cons:**
 - Start plugin manually each session (2 clicks)
+- Slightly slower than Yolo Mode
 
 ```
 ┌─────────────┐     WebSocket     ┌─────────────┐     Plugin API     ┌─────────────┐
@@ -203,6 +206,8 @@ Or manually: `node src/index.js connect --safe`
 | Corporate laptop | `fig-start --safe` |
 | Permission errors with Yolo | `fig-start --safe` |
 | Can't modify apps | `fig-start --safe` |
+
+Both modes have **full feature parity**. Safe Mode uses native Figma Plugin API implementations instead of figma-use, so all commands work identically.
 
 ---
 
@@ -481,12 +486,14 @@ Token is stored at `~/.figma-ds-cli/.daemon-token` with owner-only permissions (
 
 This CLI is built on top of **[figma-use](https://github.com/dannote/figma-use)** by [dannote](https://github.com/dannote) — an excellent Figma CLI with JSX rendering, XPath queries, design linting, and much more.
 
-We use figma-use for:
+In **Yolo Mode**, we use figma-use for:
 - JSX rendering (`render` command)
 - Node operations (`node tree`, `node to-component`, etc.)
 - Design analysis (`analyze colors`, `analyze typography`)
 - Design linting (`lint`)
 - And many other features
+
+In **Safe Mode**, all commands use native Figma Plugin API implementations, so figma-use is not required.
 
 **Big thanks to dannote for figma-use!**
 
