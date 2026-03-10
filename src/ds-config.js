@@ -113,4 +113,21 @@ export const DS_COMPONENTS = {
     collections: ['intent', 'color'],
   },
 
+  tag: {
+    /** One key per Usage */
+    keys: {
+      'Intent': 'c31ac239edb479cd0a5bcf3c005679afab4f03ba',
+      'Index':  '737dec4ccb84f4cc9de955b415f2312e5d1b78b0',
+    },
+    variants: {
+      Usage: ['Intent', 'Index'],
+    },
+    props: {
+      text:      'Text#1873:1',
+      xIcon:     'X icon#2004:0',
+    },
+    /** Intent tag → intent + dimension, Index tag → color + dimension */
+    collections: ['intent', 'color', 'dimension'],
+  },
+
 };

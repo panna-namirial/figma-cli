@@ -7783,4 +7783,73 @@ shadcn
     }
   });
 
+dsInsertCmd
+  .command('tag')
+  .description('Insert a DS 2026 tag instance')
+  .option('-u, --usage <usage>',   'Intent | Index',                    'Intent')
+  .option('-i, --intent <intent>', 'Primary | Secondary | Accent | Info | Positive | Negative | Warning', 'Primary')
+  .option('--index <n>',           '1-10 (used when --usage Index)',    '1')
+  .option('-d, --size <size>',     'xs | sm | md | lg | xl',            'sm')
+  .option('-t, --text <text>',     'Tag label',                         'Label')
+  .option('--no-dismiss',          'Hide the X icon (default: shown)')
+  .option('-x, --x <n>',          'X position',                        '100')
+  .option('-y, --y <n>',          'Y position',                        '100')
+  .action(async (opts) => {
+    const { intent: intentColl, color: colorColl, dimension: dimColl } = DS_COLLECTIONS;
+    const tag = DS_COMPONENTS.tag;
+
+    const usage = opts.usage;
+    const componentKey = tag.keys[usage];
+
+    if (!componentKey) {
+      console.error(chalk.red(`Unknown usage "${usage}". Valid: Intent, Index`));
+      process.exit(1);
+    }
+    if (usage === 'Intent' && !intentColl.modes[opts.intent]) {
+      console.error(chalk.red(`Unknown intent "${opts.intent}". Valid: ${Object.keys(intentColl.modes).join(', ')}`));
+      process.exit(1);
+    }
+    if (usage === 'Index' && !colorColl.modes[`Index-${opts.index}`]) {
+      console.error(chalk.red(`Index must be 1-10`));
+      process.exit(1);
+    }
+    if (!dimColl.modes[opts.size]) {
+      console.error(chalk.red(`Unknown size "${opts.size}". Valid: ${Object.keys(dimColl.modes).join(', ')}`));
+      process.exit(1);
+    }
+
+    const colorCollId = usage === 'Intent' ? intentColl.id : colorColl.id;
+    const colorModeId = usage === 'Intent' ? intentColl.modes[opts.intent] : colorColl.modes[`Index-${opts.index}`];
+    const dismiss = opts.dismiss !== false;
+
+    const code = `(async () => {
+      const comp = await figma.importComponentByKeyAsync('${componentKey}');
+      const inst = comp.createInstance();
+      inst.setProperties({
+        '${tag.props.text}': ${JSON.stringify(opts.text)},
+        '${tag.props.xIcon}': ${dismiss}
+      });
+      inst.setExplicitVariableModeForCollection('${colorCollId}', '${colorModeId}');
+      inst.setExplicitVariableModeForCollection('${dimColl.id}', '${dimColl.modes[opts.size]}');
+      inst.x = ${Number(opts.x)};
+      inst.y = ${Number(opts.y)};
+      figma.currentPage.appendChild(inst);
+      figma.viewport.scrollAndZoomIntoView([inst]);
+      return { id: inst.id, w: inst.width, h: inst.height };
+    })()`;
+
+    const label = usage === 'Intent' ? opts.intent : `Index-${opts.index}`;
+    const spinner = ora(`Inserting ${label} ${opts.size} tag "${opts.text}"...`).start();
+    try {
+      const result = await daemonExec('eval', { code });
+      spinner.succeed(
+        chalk.green(`Tag inserted`) +
+        chalk.gray(` — id: ${result.id}  ${result.w}×${result.h}  "${opts.text}"  ${label} / ${opts.size}`)
+      );
+    } catch (err) {
+      spinner.fail(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
 program.parse();
