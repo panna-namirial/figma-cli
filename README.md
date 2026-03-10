@@ -126,6 +126,101 @@ All components use `var:` syntax to bind directly to shadcn variables. When you 
 
 ---
 
+## DS 2026 — Insert Components from Your Design System Library
+
+Import and configure components directly from an external Figma library, with full control over intent, size, and properties — in a single command.
+
+### Setup
+
+Create a `.env` file in the project root:
+
+```
+FIGMA_API_KEY=your_figma_api_key
+FIGMA_DS_FILE_KEY=your_ds_file_key
+```
+
+All component keys, collection IDs and mode IDs are stored in `src/ds-config.js` — update that file if the library changes.
+
+### Insert Commands
+
+```bash
+# Button
+node src/index.js ds insert button \
+  --text "Salva" --intent Primary --size md --style Standard
+
+# Input field
+node src/index.js ds insert input \
+  --label "Email" --placeholder "name@example.com" \
+  --size md --required --help-text "We'll never share your email"
+
+# Badge
+node src/index.js ds insert badge --intent Negative --text "3"
+node src/index.js ds insert badge --usage Index --index 5 --text "New"
+node src/index.js ds insert badge --intent Positive --style Dot
+
+# Tag
+node src/index.js ds insert tag --intent Positive --text "Approvato" --size md
+node src/index.js ds insert tag --usage Index --index 3 --text "Design" --no-dismiss
+```
+
+### Options
+
+**Button** (`ds insert button`)
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--text` | any string | `Button label` |
+| `--style` | `Standard` · `Full-radius` · `Ghost` | `Standard` |
+| `--intent` | `Primary` · `Secondary` · `Accent` · `Info` · `Positive` · `Negative` · `Warning` | `Primary` |
+| `--size` | `xs` · `sm` · `md` · `lg` · `xl` | `sm` |
+| `--icons` | flag | hidden |
+
+**Input** (`ds insert input`)
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--label` | any string | `Label` |
+| `--placeholder` | any string | `Input text` |
+| `--help-text` | any string | hidden |
+| `--type` | `Default` · `Icon Left` · `Icon Right` · `Currency` · `Percent` · `Clear` · `Select` · `Date Picker` | `Default` |
+| `--interaction` | `Default` · `Active` · `Hover` · `Read only` | `Default` |
+| `--intent` | same as button | `Primary` |
+| `--size` | `xs` · `sm` · `md` · `lg` · `xl` | `md` |
+| `--required` / `--optional` | flag | `--required` |
+
+**Badge** (`ds insert badge`)
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--usage` | `Intent` · `Index` | `Intent` |
+| `--intent` | same as button | `Primary` |
+| `--index` | `1`–`10` | `1` |
+| `--style` | `Default` · `Dot` | `Default` |
+| `--text` | any string | `99+` |
+| `--icon` | flag | hidden |
+
+**Tag** (`ds insert tag`)
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--usage` | `Intent` · `Index` | `Intent` |
+| `--intent` | same as button | `Primary` |
+| `--index` | `1`–`10` | `1` |
+| `--size` | `xs` · `sm` · `md` · `lg` · `xl` | `sm` |
+| `--text` | any string | `Label` |
+| `--no-dismiss` | flag | X shown |
+
+### Cache Commands
+
+```bash
+node src/index.js ds info                    # cache overview
+node src/index.js ds components [filter]     # list DS components
+node src/index.js ds vars [filter]           # list DS variables (daemon required)
+node src/index.js ds refresh                 # re-fetch everything
+```
+
+---
+
 ## Why This CLI?
 
 This project includes a `CLAUDE.md` file that Claude reads automatically. It contains:
@@ -520,6 +615,15 @@ Token is stored at `~/.figma-ds-cli/.daemon-token` with owner-only permissions (
 - Connect elements with arrows
 - List FigJam elements
 - Run JavaScript in FigJam context
+
+### DS 2026 Component Insertion
+
+- **Insert Button** — style, intent, size, icons
+- **Insert Input** — label, placeholder, type, help text, interaction state
+- **Insert Badge** — Intent/Index usage, Default/Dot style
+- **Insert Tag** — Intent/Index usage, dismissible X icon
+- All components bound to correct variable collections (intent, dimension, color)
+- Single source of truth in `src/ds-config.js` — update once when DS changes
 
 ### Team Libraries
 
