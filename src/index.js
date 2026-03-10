@@ -14,6 +14,8 @@ import { createServer } from 'http';
 import { FigJamClient } from './figjam-client.js';
 import { FigmaClient } from './figma-client.js';
 import { isPatched, patchFigma, unpatchFigma, getFigmaCommand, getCdpPort } from './figma-patch.js';
+import { buildDSContext, fetchComponents, fetchLibraryVariables, loadDSCache, loadEnv as loadDSEnv, findVariable, findComponent, getColorVariables } from './ds-context.js';
+import { DS_COLLECTIONS, DS_COMPONENTS } from './ds-config.js';
 
 // Daemon configuration
 const DAEMON_PORT = 3456;
@@ -5465,6 +5467,371 @@ program
       console.log(JSON.stringify(designFiles));
     } catch (error) {
       console.error(JSON.stringify({ error: error.message }));
+      process.exit(1);
+    }
+  });
+
+// ============ DS (Design System) ============
+
+function getDSFileKey(optsFile) {
+  loadDSEnv();
+  return optsFile || process.env.FIGMA_DS_FILE_KEY || null;
+}
+
+const dsCmd = program
+  .command('ds')
+  .description('Design system commands (components via REST API, variables via daemon)');
+
+dsCmd
+  .command('info')
+  .description('Show overview of the cached DS context')
+  .action(() => {
+    const cache = loadDSCache();
+    if (!cache) {
+      console.log(chalk.gray('No cache yet. Run: ds components --refresh   ds vars --refresh'));
+      return;
+    }
+    if (cache.components) {
+      const age = Math.round((Date.now() - cache.components.timestamp) / 60000);
+      console.log(chalk.white('\n  Components:') + chalk.cyan(` ${cache.components.count}`) +
+        chalk.gray(`  (cached ${age < 1 ? 'just now' : age + 'm ago'}, file: ${cache.components.fileKey})`));
+    }
+    if (cache.variables) {
+      const age = Math.round((Date.now() - cache.variables.timestamp) / 60000);
+      console.log(chalk.white('  Variables: ') + chalk.cyan(` ${cache.variables.count}`) +
+        chalk.gray(`  (cached ${age < 1 ? 'just now' : age + 'm ago'})`));
+      console.log(chalk.gray(`  Collections: ${cache.variables.collectionNames?.join(', ')}`));
+    }
+  });
+
+dsCmd
+  .command('components [filter]')
+  .description('List DS components (REST API). Use --refresh to re-fetch.')
+  .option('-f, --file <key>', 'Figma file key (overrides FIGMA_DS_FILE_KEY in .env)')
+  .option('-r, --refresh', 'Force re-fetch from API')
+  .action(async (filter, opts) => {
+    try {
+      const fileKey = getDSFileKey(opts.file);
+      if (!fileKey) {
+        console.error(chalk.red('No file key. Set FIGMA_DS_FILE_KEY in .env or pass --file <key>'));
+        process.exit(1);
+      }
+
+      let ctx;
+      const cache = loadDSCache();
+      if (!opts.refresh && cache?.components?.fileKey === fileKey) {
+        ctx = cache.components;
+      } else {
+        const spinner = ora('Fetching components...').start();
+        ctx = await fetchComponents(fileKey, { force: !!opts.refresh });
+        spinner.succeed(`${ctx.count} components cached`);
+      }
+
+      const comps = Object.values(ctx.components)
+        .filter(c => !filter || c.name.toLowerCase().includes(filter.toLowerCase()))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      if (comps.length === 0) { console.log(chalk.gray('No components found.')); return; }
+
+      console.log(chalk.gray(`\n  ${comps.length} component(s):\n`));
+      for (const c of comps) {
+        const loc = [c.page, c.frame].filter(Boolean).join(' / ');
+        console.log(`  ${chalk.white(c.name)}  ${chalk.gray(loc)}`);
+      }
+    } catch (err) {
+      console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
+dsCmd
+  .command('vars [filter]')
+  .description('List DS variables (via daemon — Figma must be open). Use --refresh to re-fetch.')
+  .option('-a, --all', 'Show all variable types, not just COLOR')
+  .option('-r, --refresh', 'Force re-fetch via daemon')
+  .action(async (filter, opts) => {
+    try {
+      let ctx;
+      const cache = loadDSCache();
+      if (!opts.refresh && cache?.variables) {
+        ctx = cache.variables;
+      } else {
+        const spinner = ora('Fetching variables from Figma (daemon)...').start();
+        ctx = await fetchLibraryVariables({ force: !!opts.refresh });
+        spinner.succeed(`${ctx.count} variables cached`);
+      }
+
+      const all = Object.values(ctx.variables);
+      const filtered = all.filter(v =>
+        (!filter || v.name.toLowerCase().includes(filter.toLowerCase())) &&
+        (opts.all || v.type === 'COLOR')
+      ).sort((a, b) => a.name.localeCompare(b.name));
+
+      if (filtered.length === 0) { console.log(chalk.gray('No variables found.')); return; }
+
+      console.log(chalk.gray(`\n  ${filtered.length} variable(s):\n`));
+      for (const v of filtered) {
+        console.log(`  ${chalk.white(v.name)}  ${chalk.gray(`[${v.type}]  ${v.collection ?? ''} — ${v.library ?? ''}`)}`);
+      }
+    } catch (err) {
+      console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
+dsCmd
+  .command('refresh')
+  .description('Re-fetch both components (REST) and variables (daemon)')
+  .option('-f, --file <key>', 'Figma file key')
+  .action(async (opts) => {
+    const fileKey = getDSFileKey(opts.file);
+    if (!fileKey) {
+      console.error(chalk.red('No file key. Set FIGMA_DS_FILE_KEY in .env or pass --file <key>'));
+      process.exit(1);
+    }
+
+    const s1 = ora('Fetching components...').start();
+    try {
+      const comps = await fetchComponents(fileKey, { force: true });
+      s1.succeed(`${comps.count} components`);
+    } catch (err) {
+      s1.fail(`Components: ${err.message}`);
+    }
+
+    const s2 = ora('Fetching variables (daemon)...').start();
+    try {
+      const vars = await fetchLibraryVariables({ force: true });
+      s2.succeed(`${vars.count} variables across: ${vars.collectionNames.join(', ')}`);
+    } catch (err) {
+      s2.fail(`Variables: ${err.message}`);
+    }
+  });
+
+// ============ DS INSERT ============
+
+const dsInsertCmd = dsCmd
+  .command('insert')
+  .description('Insert DS components onto the canvas');
+
+dsInsertCmd
+  .command('button')
+  .description('Insert a DS 2026 button instance')
+  .option('-t, --text <label>',    'Button label',                      'Button label')
+  .option('-s, --style <style>',   'Standard | Full-radius | Ghost',     'Standard')
+  .option('-i, --intent <intent>', 'Primary | Secondary | Accent | Info | Positive | Negative | Warning', 'Primary')
+  .option('-d, --size <size>',     'xs | sm | md | lg | xl',             'sm')
+  .option('--icons',               'Show leading + trailing icons (default: hidden)')
+  .option('-x, --x <n>',          'X position on canvas',               '100')
+  .option('-y, --y <n>',          'Y position on canvas',               '100')
+  .action(async (opts) => {
+    const { intent: intentColl, dimension: dimColl } = DS_COLLECTIONS;
+    const btn = DS_COMPONENTS.button;
+
+    const style  = opts.style;
+    const intent = opts.intent;
+    const size   = opts.size;
+    const text   = opts.text;
+    const icons  = !!opts.icons;
+    const x      = Number(opts.x);
+    const y      = Number(opts.y);
+
+    if (!intentColl.modes[intent]) {
+      console.error(chalk.red(`Unknown intent "${intent}". Valid: ${Object.keys(intentColl.modes).join(', ')}`));
+      process.exit(1);
+    }
+    if (!dimColl.modes[size]) {
+      console.error(chalk.red(`Unknown size "${size}". Valid: ${Object.keys(dimColl.modes).join(', ')}`));
+      process.exit(1);
+    }
+
+    const code = `(async () => {
+      const comp = await figma.importComponentByKeyAsync('${btn.key}');
+      const inst = comp.createInstance();
+      inst.setProperties({
+        'Style': '${style}',
+        'Icon-only': 'False',
+        '${btn.props.leadingIcon}': ${icons},
+        '${btn.props.trailingIcon}': ${icons},
+        '${btn.props.text}': ${JSON.stringify(text)}
+      });
+      inst.setExplicitVariableModeForCollection('${intentColl.id}', '${intentColl.modes[intent]}');
+      inst.setExplicitVariableModeForCollection('${dimColl.id}', '${dimColl.modes[size]}');
+      inst.x = ${x};
+      inst.y = ${y};
+      figma.currentPage.appendChild(inst);
+      figma.viewport.scrollAndZoomIntoView([inst]);
+      return { id: inst.id, w: inst.width, h: inst.height, text: '${text}', intent: '${intent}', size: '${size}', style: '${style}' };
+    })()`;
+
+    const spinner = ora(`Inserting ${intent} ${size} ${style} button...`).start();
+    try {
+      const result = await daemonExec('eval', { code });
+      spinner.succeed(
+        chalk.green(`Button inserted`) +
+        chalk.gray(` — id: ${result.id}  ${result.w}×${result.h}  "${result.text}"  ${result.intent} / ${result.size} / ${result.style}`)
+      );
+    } catch (err) {
+      spinner.fail(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
+dsInsertCmd
+  .command('input')
+  .description('Insert a DS 2026 input field instance')
+  .option('-l, --label <text>',       'Label text',                        'Label')
+  .option('-p, --placeholder <text>', 'Placeholder text',                  'Input text')
+  .option('--help-text <text>',       'Help text below field (shown if set)')
+  .option('--interaction <val>',      'Default | Active | Hover | Read only', 'Default')
+  .option('--type <val>',             'Default | Icon Left | Icon Right | Currency | Percent | Clear | Select | Date Picker', 'Default')
+  .option('-i, --intent <intent>',    'Primary | Secondary | Info | Positive | Negative | Warning', 'Primary')
+  .option('-d, --size <size>',        'xs | sm | md | lg | xl',            'md')
+  .option('--required',               'Show required marker (default)')
+  .option('--optional',               'Show optional marker instead of required')
+  .option('-x, --x <n>',             'X position',                        '100')
+  .option('-y, --y <n>',             'Y position',                        '100')
+  .action(async (opts) => {
+    const { intent: intentColl, dimension: dimColl } = DS_COLLECTIONS;
+    const inp = DS_COMPONENTS.input;
+
+    if (!intentColl.modes[opts.intent]) {
+      console.error(chalk.red(`Unknown intent "${opts.intent}". Valid: ${Object.keys(intentColl.modes).join(', ')}`));
+      process.exit(1);
+    }
+    if (!dimColl.modes[opts.size]) {
+      console.error(chalk.red(`Unknown size "${opts.size}". Valid: ${Object.keys(dimColl.modes).join(', ')}`));
+      process.exit(1);
+    }
+
+    const showHelp = !!opts.helpText;
+    const isOptional = !!opts.optional;
+    const isRequired = !isOptional;
+
+    const code = `(async () => {
+      const comp = await figma.importComponentByKeyAsync('${inp.key}');
+      const inst = comp.createInstance();
+
+      // Top-level: show/hide help text
+      inst.setProperties({ '${inp.props.showHelpText}': ${showHelp} });
+
+      // Label
+      const labelInst = inst.children.find(c => c.name === 'Label');
+      if (labelInst) labelInst.setProperties({
+        '${inp.props.labelText}': ${JSON.stringify(opts.label)},
+        '${inp.props.required}': ${isRequired},
+        '${inp.props.optional}': ${isOptional}
+      });
+
+      // Interaction state
+      const container = inst.children.find(c => c.name === 'Input container');
+      if (container) container.setProperties({ 'Interaction': ${JSON.stringify(opts.interaction)} });
+
+      // Input type
+      const content = container?.children?.find(c => c.name === 'Input content');
+      if (content) content.setProperties({ 'Type': ${JSON.stringify(opts.type)} });
+
+      // Placeholder text — child name changes with Type (Input text, Input Select, etc.)
+      // so we find the first INSTANCE inside Input content instead of searching by name
+      const textInst = content?.children?.find(c => c.type === 'INSTANCE');
+      if (textInst) textInst.setProperties({
+        'Text#1341:0': ${JSON.stringify(opts.placeholder)},
+        'Status': 'Placeholder'
+      });
+
+      // Help text
+      if (${showHelp}) {
+        const helpInst = inst.children.find(c => c.name === 'Help text');
+        if (helpInst) helpInst.setProperties({
+          '${inp.props.helpText}': ${JSON.stringify(opts.helpText || '')},
+          '${inp.props.helpTextValue}': ${JSON.stringify(opts.helpText || '')}
+        });
+      }
+
+      // Variable modes
+      inst.setExplicitVariableModeForCollection('${intentColl.id}', '${intentColl.modes[opts.intent]}');
+      inst.setExplicitVariableModeForCollection('${dimColl.id}', '${dimColl.modes[opts.size]}');
+
+      inst.x = ${Number(opts.x)};
+      inst.y = ${Number(opts.y)};
+      figma.currentPage.appendChild(inst);
+      figma.viewport.scrollAndZoomIntoView([inst]);
+      return { id: inst.id, w: inst.width, h: inst.height };
+    })()`;
+
+    const spinner = ora(`Inserting ${opts.intent} ${opts.size} input "${opts.label}"...`).start();
+    try {
+      const result = await daemonExec('eval', { code });
+      spinner.succeed(
+        chalk.green(`Input inserted`) +
+        chalk.gray(` — id: ${result.id}  ${result.w}×${result.h}  label: "${opts.label}"  ${opts.intent} / ${opts.size}`)
+      );
+    } catch (err) {
+      spinner.fail(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
+dsInsertCmd
+  .command('badge')
+  .description('Insert a DS 2026 badge instance')
+  .option('-u, --usage <usage>',    'Intent | Index',                    'Intent')
+  .option('-i, --intent <intent>',  'Primary | Secondary | Accent | Info | Positive | Negative | Warning', 'Primary')
+  .option('--index <n>',            '1-10 (used when --usage Index)',    '1')
+  .option('-s, --style <style>',    'Default | Dot',                     'Default')
+  .option('-t, --text <text>',      'Badge text (ignored for Dot)',      '99+')
+  .option('--icon',                 'Show leading icon')
+  .option('-x, --x <n>',           'X position',                        '100')
+  .option('-y, --y <n>',           'Y position',                        '100')
+  .action(async (opts) => {
+    const { intent: intentColl, color: colorColl } = DS_COLLECTIONS;
+    const bdg = DS_COMPONENTS.badge;
+
+    const usage = opts.usage;
+    const style = opts.style;
+    const componentKey = bdg.keys[`${usage}-${style}`];
+
+    if (!componentKey) {
+      console.error(chalk.red(`Invalid combination --usage ${usage} --style ${style}. Valid: Intent/Index + Default/Dot`));
+      process.exit(1);
+    }
+    if (usage === 'Intent' && !intentColl.modes[opts.intent]) {
+      console.error(chalk.red(`Unknown intent "${opts.intent}". Valid: ${Object.keys(intentColl.modes).join(', ')}`));
+      process.exit(1);
+    }
+    if (usage === 'Index' && !colorColl.modes[`Index-${opts.index}`]) {
+      console.error(chalk.red(`Index must be 1-10`));
+      process.exit(1);
+    }
+
+    const modeCollection = usage === 'Intent' ? intentColl.id : colorColl.id;
+    const modeId = usage === 'Intent' ? intentColl.modes[opts.intent] : colorColl.modes[`Index-${opts.index}`];
+
+    const code = `(async () => {
+      const comp = await figma.importComponentByKeyAsync('${componentKey}');
+      const inst = comp.createInstance();
+      const propsToSet = {
+        '${bdg.props.leadingIcon}': ${!!opts.icon}
+      };
+      ${style === 'Default' ? `propsToSet['${bdg.props.text}'] = ${JSON.stringify(opts.text)};` : ''}
+      inst.setProperties(propsToSet);
+      inst.setExplicitVariableModeForCollection('${modeCollection}', '${modeId}');
+      inst.x = ${Number(opts.x)};
+      inst.y = ${Number(opts.y)};
+      figma.currentPage.appendChild(inst);
+      figma.viewport.scrollAndZoomIntoView([inst]);
+      return { id: inst.id, w: inst.width, h: inst.height };
+    })()`;
+
+    const label = usage === 'Intent' ? opts.intent : `Index-${opts.index}`;
+    const spinner = ora(`Inserting ${label} ${style} badge...`).start();
+    try {
+      const result = await daemonExec('eval', { code });
+      spinner.succeed(
+        chalk.green(`Badge inserted`) +
+        chalk.gray(` — id: ${result.id}  ${result.w}×${result.h}  ${label} / ${style}`)
+      );
+    } catch (err) {
+      spinner.fail(chalk.red(err.message));
       process.exit(1);
     }
   });

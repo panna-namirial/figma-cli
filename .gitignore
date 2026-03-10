@@ -1,3 +1,5 @@
 .DS_Store
 *.log
 DEV-NOTES.md
+.env
+.ds-cache.json
