@@ -130,4 +130,15 @@ export const DS_COMPONENTS = {
     collections: ['intent', 'color', 'dimension'],
   },
 
+  checkbox: {
+    /** Base variant key (Selection=OFF, Interaction=Default) */
+    key: 'ca752d34d407e4555b7f354667414fda11b2de86',
+    variants: {
+      Selection:   ['ON', 'Mixed', 'OFF'],
+      Interaction: ['Default', 'Hover', 'Read-only'],
+    },
+    props: {},       // No boolean/text props — label is outside the component
+    collections: [], // Uses "Component no-modes" only — no mode-switching
+  },
+
 };

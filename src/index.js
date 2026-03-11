@@ -7852,4 +7852,53 @@ dsInsertCmd
     }
   });
 
+dsInsertCmd
+  .command('checkbox')
+  .description('Insert a DS 2026 Checkbox instance')
+  .option('-s, --selection <value>', 'Selection state: ON | Mixed | OFF', 'OFF')
+  .option('--interaction <value>',   'Interaction state: Default | Hover | Read-only', 'Default')
+  .option('-x, --x <n>',            'X position on canvas', '100')
+  .option('-y, --y <n>',            'Y position on canvas', '100')
+  .action(async (opts) => {
+    const cb = DS_COMPONENTS.checkbox;
+
+    const validSelections   = cb.variants.Selection;
+    const validInteractions = cb.variants.Interaction;
+
+    if (!validSelections.includes(opts.selection)) {
+      console.error(chalk.red(`Unknown selection "${opts.selection}". Valid: ${validSelections.join(', ')}`));
+      process.exit(1);
+    }
+    if (!validInteractions.includes(opts.interaction)) {
+      console.error(chalk.red(`Unknown interaction "${opts.interaction}". Valid: ${validInteractions.join(', ')}`));
+      process.exit(1);
+    }
+
+    const code = `(async () => {
+      const comp = await figma.importComponentByKeyAsync('${cb.key}');
+      const inst = comp.createInstance();
+      inst.setProperties({
+        'Selection':   '${opts.selection}',
+        'Interaction': '${opts.interaction}',
+      });
+      inst.x = ${Number(opts.x)};
+      inst.y = ${Number(opts.y)};
+      figma.currentPage.appendChild(inst);
+      figma.viewport.scrollAndZoomIntoView([inst]);
+      return { id: inst.id, w: Math.round(inst.width), h: Math.round(inst.height) };
+    })()`;
+
+    const spinner = ora(`Inserting checkbox (${opts.selection})...`).start();
+    try {
+      const result = await daemonExec('eval', { code });
+      spinner.succeed(
+        chalk.green(`Checkbox inserted`) +
+        chalk.gray(` — id: ${result.id}  ${result.w}×${result.h}  Selection: ${opts.selection}  Interaction: ${opts.interaction}`)
+      );
+    } catch (err) {
+      spinner.fail(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
 program.parse();
