@@ -7853,6 +7853,52 @@ dsInsertCmd
   });
 
 dsInsertCmd
+  .command('toggle')
+  .description('Insert a DS 2026 Toggle (Switch) instance')
+  .option('-s, --selection <value>', 'Selection state: ON | OFF | Middle', 'OFF')
+  .option('--interaction <value>',   'Interaction state: Default | Hover | Read-only', 'Default')
+  .option('-x, --x <n>',            'X position on canvas', '100')
+  .option('-y, --y <n>',            'Y position on canvas', '100')
+  .action(async (opts) => {
+    const tgl = DS_COMPONENTS.toggle;
+
+    if (!tgl.variants.Selection.includes(opts.selection)) {
+      console.error(chalk.red(`Unknown selection "${opts.selection}". Valid: ${tgl.variants.Selection.join(', ')}`));
+      process.exit(1);
+    }
+    if (!tgl.variants.Interaction.includes(opts.interaction)) {
+      console.error(chalk.red(`Unknown interaction "${opts.interaction}". Valid: ${tgl.variants.Interaction.join(', ')}`));
+      process.exit(1);
+    }
+
+    const code = `(async () => {
+      const comp = await figma.importComponentByKeyAsync('${tgl.key}');
+      const inst = comp.createInstance();
+      inst.setProperties({
+        'Selection':   '${opts.selection}',
+        'Interaction': '${opts.interaction}',
+      });
+      inst.x = ${Number(opts.x)};
+      inst.y = ${Number(opts.y)};
+      figma.currentPage.appendChild(inst);
+      figma.viewport.scrollAndZoomIntoView([inst]);
+      return { id: inst.id, w: Math.round(inst.width), h: Math.round(inst.height) };
+    })()`;
+
+    const spinner = ora(`Inserting toggle (${opts.selection})...`).start();
+    try {
+      const result = await daemonExec('eval', { code });
+      spinner.succeed(
+        chalk.green(`Toggle inserted`) +
+        chalk.gray(` — id: ${result.id}  ${result.w}×${result.h}  Selection: ${opts.selection}  Interaction: ${opts.interaction}`)
+      );
+    } catch (err) {
+      spinner.fail(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
+dsInsertCmd
   .command('checkbox')
   .description('Insert a DS 2026 Checkbox instance')
   .option('-s, --selection <value>', 'Selection state: ON | Mixed | OFF', 'OFF')
