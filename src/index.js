@@ -101,6 +101,23 @@ function isDaemonRunning(returnDetails = false) {
 }
 
 // Send command to daemon (uses native fetch in Node 18+)
+// Start daemon if not running and wait until it responds (max 15s)
+async function ensureDaemon() {
+  if (isDaemonRunning()) return;
+
+  startDaemon(false, 'auto');
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 600));
+    if (isDaemonRunning()) return;
+  }
+  throw new Error(
+    'Could not connect to Figma. Is Figma open with a file?\n' +
+    'Try: node src/index.js connect'
+  );
+}
+
 async function daemonExec(action, data = {}, timeoutMs = 90000) {
   const token = getDaemonToken();
   const headers = { 'Content-Type': 'application/json' };
@@ -162,6 +179,15 @@ async function daemonExec(action, data = {}, timeoutMs = 90000) {
   } catch (e) {
     if (e.name === 'TimeoutError' || e.message.includes('timeout')) {
       throw new Error(`Execution timeout (${timeoutMs/1000}s). Try reconnecting: node src/index.js connect`);
+    }
+    // Auto-reconnect: daemon not running (ECONNREFUSED) — start it and retry once
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message?.includes('ECONNREFUSED') || e.message === 'fetch failed';
+    if (isConnRefused && !data._retried) {
+      await ensureDaemon();
+      // Re-read token after daemon restart (it may have changed)
+      const newToken = getDaemonToken();
+      if (newToken) headers['X-Daemon-Token'] = newToken;
+      return daemonExec(action, { ...data, _retried: true }, timeoutMs);
     }
     throw e;
   }
@@ -239,7 +265,9 @@ function startDaemon(forceRestart = false, mode = 'auto') {
   const newToken = generateDaemonToken();
 
   const daemonScript = join(dirname(fileURLToPath(import.meta.url)), 'daemon.js');
-  const child = spawn('node', [daemonScript], {
+  // Use process.execPath so the daemon starts with the same Node binary
+  // regardless of whether 'node' is in PATH (fixes nvm environments)
+  const child = spawn(process.execPath, [daemonScript], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, DAEMON_PORT: String(DAEMON_PORT), DAEMON_MODE: mode }
