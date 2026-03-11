@@ -7881,6 +7881,43 @@ dsInsertCmd
   });
 
 dsInsertCmd
+  .command('radio')
+  .description('Insert a DS 2026 Radio button instance')
+  .option('-s, --selection <value>', 'Selection state: ON | OFF', 'OFF')
+  .option('--interaction <value>',   'Interaction state: Default | Hover | Read-only', 'Default')
+  .option('-x, --x <n>',            'X position on canvas', '100')
+  .option('-y, --y <n>',            'Y position on canvas', '100')
+  .action(async (opts) => {
+    const rb = DS_COMPONENTS.radio;
+    if (!rb.variants.Selection.includes(opts.selection)) {
+      console.error(chalk.red(`Unknown selection "${opts.selection}". Valid: ${rb.variants.Selection.join(', ')}`));
+      process.exit(1);
+    }
+    if (!rb.variants.Interaction.includes(opts.interaction)) {
+      console.error(chalk.red(`Unknown interaction "${opts.interaction}". Valid: ${rb.variants.Interaction.join(', ')}`));
+      process.exit(1);
+    }
+    const code = `(async () => {
+      const comp = await figma.importComponentByKeyAsync('${rb.key}');
+      const inst = comp.createInstance();
+      inst.setProperties({ 'Selection': '${opts.selection}', 'Interaction': '${opts.interaction}' });
+      inst.x = ${Number(opts.x)};
+      inst.y = ${Number(opts.y)};
+      figma.currentPage.appendChild(inst);
+      figma.viewport.scrollAndZoomIntoView([inst]);
+      return { id: inst.id, w: Math.round(inst.width), h: Math.round(inst.height) };
+    })()`;
+    const spinner = ora(`Inserting radio (${opts.selection})...`).start();
+    try {
+      const result = await daemonExec('eval', { code });
+      spinner.succeed(chalk.green(`Radio inserted`) + chalk.gray(` — id: ${result.id}  ${result.w}×${result.h}  Selection: ${opts.selection}  Interaction: ${opts.interaction}`));
+    } catch (err) {
+      spinner.fail(chalk.red(err.message));
+      process.exit(1);
+    }
+  });
+
+dsInsertCmd
   .command('toggle')
   .description('Insert a DS 2026 Toggle (Switch) instance')
   .option('-s, --selection <value>', 'Selection state: ON | OFF | Middle', 'OFF')

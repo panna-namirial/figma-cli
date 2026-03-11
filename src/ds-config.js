@@ -141,6 +141,17 @@ export const DS_COMPONENTS = {
     collections: [], // Uses "Component no-modes" only — no mode-switching
   },
 
+  radio: {
+    /** Base variant key (Selection=OFF, Interaction=Default) */
+    key: '1574f5e2e00a27fb65f85a6cea267098688f1e2d',
+    variants: {
+      Selection:   ['ON', 'OFF'],
+      Interaction: ['Default', 'Hover', 'Read-only'],
+    },
+    props: {},       // No boolean/text props — label is outside the component
+    collections: [], // Uses "Component no-modes" only — no mode-switching
+  },
+
   toggle: {
     /** DS 2026 component name: "Switch" */
     /** Base variant key (Selection=OFF, Interaction=Default) */
