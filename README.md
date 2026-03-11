@@ -161,6 +161,20 @@ node src/index.js ds insert badge --intent Positive --style Dot
 # Tag
 node src/index.js ds insert tag --intent Positive --text "Approvato" --size md
 node src/index.js ds insert tag --usage Index --index 3 --text "Design" --no-dismiss
+
+# Checkbox
+node src/index.js ds insert checkbox --selection OFF
+node src/index.js ds insert checkbox --selection ON
+node src/index.js ds insert checkbox --selection Mixed
+
+# Radio
+node src/index.js ds insert radio --selection ON
+node src/index.js ds insert radio --selection OFF --interaction Read-only
+
+# Toggle (Switch)
+node src/index.js ds insert toggle --selection OFF
+node src/index.js ds insert toggle --selection ON
+node src/index.js ds insert toggle --selection Middle
 ```
 
 ### Options
@@ -209,6 +223,27 @@ node src/index.js ds insert tag --usage Index --index 3 --text "Design" --no-dis
 | `--size` | `xs` · `sm` · `md` · `lg` · `xl` | `sm` |
 | `--text` | any string | `Label` |
 | `--no-dismiss` | flag | X shown |
+
+**Checkbox** (`ds insert checkbox`)
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--selection` | `ON` · `Mixed` · `OFF` | `OFF` |
+| `--interaction` | `Default` · `Hover` · `Read-only` | `Default` |
+
+**Radio** (`ds insert radio`)
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--selection` | `ON` · `OFF` | `OFF` |
+| `--interaction` | `Default` · `Hover` · `Read-only` | `Default` |
+
+**Toggle** (`ds insert toggle`)
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--selection` | `ON` · `OFF` · `Middle` | `OFF` |
+| `--interaction` | `Default` · `Hover` · `Read-only` | `Default` |
 
 ### Cache Commands
 
